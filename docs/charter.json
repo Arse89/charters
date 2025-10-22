@@ -1,7 +1,7 @@
 {
-  "source": "consum.es (sitemap + get-map/<id>)",
+  "source": "consum.es (sitemap + ficha + JSON-LD + get-map fallback)",
   "city_filter": "barcelona",
-  "last_updated": "2025-10-22T01:46:20.070Z",
+  "last_updated": "2025-10-22T01:52:57.266Z",
   "count": 0,
   "items": []
 }
