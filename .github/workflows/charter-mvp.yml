@@ -1,14 +1,6 @@
-name: charter-daily
+name: charter-mvp
 on:
-  workflow_dispatch:
-    inputs:
-      city:
-        description: "Provincia slug (ej.: barcelona). Usa 'all' para recorrer varias."
-        required: false
-        default: "barcelona"
-  schedule:
-    - cron: "15 6,18 * * *"   # 06:15 y 18:15 UTC
-
+  workflow_dispatch: {}
 permissions:
   contents: write
 
@@ -18,24 +10,55 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: "20" }
+        with:
+          node-version: "20"
       - name: Install Puppeteer
         run: npm i puppeteer@22
 
-      - name: Scrape Charter con filtro UI + auto-scroll
-        env:
-          CITY: ${{ github.event.inputs.city }}
+      - name: Scrape Charter (Barcelona, headless, sin XPath)
         run: |
           node - <<'JS'
           const fs = require("fs/promises");
           const puppeteer = require("puppeteer");
 
-          const CITY = (process.env.CITY || "barcelona").toLowerCase();
           const ORIGIN = "https://www.consum.es";
-          const PROVS = ["valencia","alicante","castellon","barcelona","tarragona","lleida","girona","murcia","albacete","almeria","cuenca","toledo","ciudad-real"];
-          const LIST = CITY==="all" ? PROVS : [CITY];
+          const START  = `${ORIGIN}/supermercados/barcelona/`;
 
           const norm = s => (s||"").normalize("NFD").replace(/\p{Diacritic}/gu,"").toLowerCase();
+
+          async function clickCookieIfAny(page){
+            // OneTrust típico
+            const ot = await page.$('#onetrust-accept-btn-handler');
+            if (ot) { await ot.click().catch(()=>{}); await page.waitForTimeout(600); return; }
+            // Botón con texto "Aceptar"/"Accept" sin XPath
+            await page.evaluate(() => {
+              const texts = ["aceptar","accept","agree","consent"];
+              const els = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+              const hit = els.find(el => texts.some(t => (el.textContent||"").trim().toLowerCase() === t));
+              if (hit) hit.click();
+            });
+            await page.waitForTimeout(600);
+          }
+
+          async function applyCharterFilter(page){
+            // Busca el control de Charter por texto o value/id
+            const clicked = await page.evaluate(() => {
+              const byLabel = Array.from(document.querySelectorAll('label')).find(l => (l.textContent||"").trim().toLowerCase() === 'charter');
+              if (byLabel){
+                const inp = byLabel.querySelector('input');
+                if (inp) { inp.click(); return true; }
+                byLabel.click(); return true;
+              }
+              const inp = document.querySelector('input[id*="charter" i], input[value*="charter" i], input[name*="charter" i]');
+              if (inp){ inp.click(); return true; }
+              // botones/links
+              const btn = Array.from(document.querySelectorAll('button,a,span')).find(n => (n.textContent||"").trim().toLowerCase()==='charter');
+              if (btn){ btn.click(); return true; }
+              return false;
+            });
+            await page.waitForTimeout(1200);
+            return clicked;
+          }
 
           async function autoScroll(page, max=40, wait=1200){
             let last = 0;
@@ -50,130 +73,83 @@ jobs:
             return last;
           }
 
-          async function clickCookieIfAny(page){
-            const texts = ["Aceptar", "Accept", "Agree", "Consentir"];
-            for (const t of texts){
-              const btn = await page.$x(`//button[normalize-space()="${t}"] | //a[normalize-space()="${t}"]`);
-              if (btn.length){ await btn[0].click().catch(()=>{}); await page.waitForTimeout(500); return; }
-            }
-            // selectores típicos
-            for (const sel of ['#onetrust-accept-btn-handler','button[aria-label*="acept"]','button[aria-label*="accept"]']){
-              const el = await page.$(sel);
-              if (el){ await el.click().catch(()=>{}); await page.waitForTimeout(500); return; }
-            }
-          }
-
-          async function applyCharterFilter(page){
-            // Busca un control con texto “Charter” y clica su label/botón
-            const clicked = await page.evaluate(() => {
-              const all = [...document.querySelectorAll('label, button, a, span')];
-              const target = all.find(n => n.textContent && n.textContent.trim().toLowerCase() === 'charter');
-              if (target){
-                const label = target.closest('label') || target;
-                (label.querySelector('input') || label).click();
-                return true;
-              }
-              // alternativa: inputs cuyo value o id contenga charter
-              const inp = document.querySelector('input[value*="charter" i], input[id*="charter" i]');
-              if (inp){ inp.click(); return true; }
-              return false;
-            });
-            await page.waitForTimeout(1200);
-            return clicked;
-          }
-
-          function isCardCharterHTML(html){
-            const h = html.toLowerCase();
-            return h.includes('col-distancia charter') || h.includes('icon_map_charter');
-          }
-
-          async function scrapeProvince(browser, prov){
-            const start = `${ORIGIN}/supermercados/${prov}/`;
+          (async ()=>{
+            const browser = await puppeteer.launch({ headless:"new", args:["--no-sandbox","--disable-setuid-sandbox"] });
             const page = await browser.newPage();
             await page.setUserAgent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125 Safari/537.36");
-            await page.goto(start, {waitUntil:"domcontentloaded", timeout:60000});
+            await page.setExtraHTTPHeaders({ "Accept-Language":"es-ES,es;q=0.9" });
+
+            await page.goto(START, { waitUntil:"domcontentloaded", timeout:60000 });
             await clickCookieIfAny(page);
-
-            // Aplica filtro Charter antes de cargar tarjetas
             await applyCharterFilter(page).catch(()=>{});
-
             const n = await autoScroll(page);
-            console.error(`[SCROLL] ${prov} tarjetas=${n}`);
+            console.error(`[SCROLL] tarjetas=${n}`);
 
-            // Lee tarjetas visibles y filtra Charter por HTML
             const cards = await page.$$eval('article.node--type-supermarket-map', els =>
               els.map(el => {
                 const a = el.querySelector('.supermarket-label a');
-                return { html: el.innerHTML, url: a ? a.href : null, name: a ? a.textContent.trim() : null };
+                return {
+                  html: el.innerHTML.toLowerCase(),
+                  url: a ? a.href : null,
+                  name: a ? a.textContent.trim() : null
+                };
               })
             );
-            const charterCards = cards.filter(c => c.url && (c.html.toLowerCase().includes('col-distancia charter') || c.html.toLowerCase().includes('icon_map_charter')));
-            const uniq = charterCards.filter((v,i,a)=>a.findIndex(x=>x.url===v.url)===i);
-            console.error(`[PICK] ${prov} charter_cards=${uniq.length}`);
 
-            // Visita cada ficha para coords y dirección
+            const charterCards = cards
+              .filter(c => c.url && (c.html.includes('col-distancia charter') || c.html.includes('icon_map_charter')))
+              .filter((v,i,a)=>a.findIndex(x=>x.url===v.url)===i);
+
+            console.error(`[PICK] charter_cards=${charterCards.length}`);
+
             const detail = await browser.newPage();
             const out = [];
-            for (const s of uniq){
+            for (const s of charterCards){
               try{
-                await detail.goto(s.url, {waitUntil:"domcontentloaded", timeout:60000});
+                await detail.goto(s.url, { waitUntil:"domcontentloaded", timeout:60000 });
+
                 // JSON-LD
-                const ld = await detail.$$eval('script[type="application/ld+json"]', ns => ns.map(n=>n.textContent));
+                const ldTexts = await detail.$$eval('script[type="application/ld+json"]', ns => ns.map(n=>n.textContent));
                 let addr=null, lat=null, lon=null;
-                for (const txt of ld){
+                for (const txt of ldTexts){
                   try{
                     const val = JSON.parse(txt); const arr = Array.isArray(val)?val:[val];
                     for (const o of arr){
-                      const a=o?.address; if(a && !addr){ addr=[a.streetAddress,a.postalCode,a.addressLocality,a.addressRegion].filter(Boolean).join(', '); }
+                      const a=o?.address; if (a && !addr) addr=[a.streetAddress,a.postalCode,a.addressLocality,a.addressRegion].filter(Boolean).join(', ');
                       const g=o?.geo||o?.GeoCoordinates||o?.location?.geo;
-                      if(g && g.latitude!=null && g.longitude!=null){ lat=+g.latitude; lon=+g.longitude; }
+                      if (g && g.latitude!=null && g.longitude!=null){ lat=+g.latitude; lon=+g.longitude; }
                     }
                   }catch{}
                 }
-                // fallback POINT(lon lat)
-                if(lat==null || lon==null){
+                if (lat==null || lon==null){
                   const html = await detail.content();
                   const m = html.match(/POINT\s*\(([-\d.]+)\s+([-\d.]+)\)/i);
-                  if(m){ lon=+m[1]; lat=+m[2]; }
+                  if (m){ lon=+m[1]; lat=+m[2]; }
                 }
-                // id
                 const nid = await detail.evaluate(() => {
-                  const m1 = document.documentElement.innerHTML.match(/data-history-node-id=["'](\d+)["']/i);
-                  if (m1) return m1[1];
-                  const link = document.querySelector('link[rel="shortlink"]');
-                  const m2 = link && link.href.match(/\/node\/(\d+)/);
-                  return m2 ? m2[1] : null;
+                  const l = document.querySelector('link[rel="shortlink"]');
+                  const m = l && l.href.match(/\/node\/(\d+)/);
+                  return m ? m[1] : null;
                 });
 
-                out.push({ id:nid, name:s.name, address:addr, lat, lon, url:s.url, ensena:"Charter", province:prov });
-              }catch(e){}
+                out.push({ id:nid, name:s.name, address:addr, lat, lon, url:s.url, ensena:"Charter", province:"barcelona" });
+              }catch{}
             }
 
-            await page.close(); await detail.close();
-            return out;
-          }
-
-          (async()=>{
-            const browser = await puppeteer.launch({ headless:"new", args:["--no-sandbox","--disable-setuid-sandbox"] });
-            let all = [];
-            for (const prov of LIST){
-              const res = await scrapeProvince(browser, prov);
-              all = all.concat(res);
-            }
             await browser.close();
 
             // dedupe
             const seen = new Set();
-            const items = all.filter(x=>{
+            const items = out.filter(x=>{
               const k = x.id ? `id:${x.id}` : `na:${norm(x.name)}|${norm(x.address)}|${x.url}`;
               if (seen.has(k)) return false; seen.add(k); return true;
             });
 
-            await fs.mkdir("docs", {recursive:true});
+            await fs.mkdir("docs", { recursive:true });
             await fs.writeFile("docs/charter.json", JSON.stringify({
               source:"puppeteer (filtro UI + scroll + ficha)",
-              city_filter: CITY,
-              last_updated: new Date().toISOString(),
+              city:"barcelona",
+              last_updated:new Date().toISOString(),
               count: items.length,
               items
             }, null, 2));
@@ -181,6 +157,7 @@ jobs:
               type:"FeatureCollection",
               features: items.map(s=>({ type:"Feature", geometry:{type:"Point", coordinates:[s.lon,s.lat]}, properties:{ id:s.id,name:s.name,address:s.address,province:s.province,url:s.url,ensena:s.ensena } }))
             }, null, 2));
+
             console.error(`[END] total_charter=${items.length}`);
             console.log("OK");
           })().catch(e=>{ console.error(e); process.exit(1); });
