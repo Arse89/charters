@@ -8,7 +8,6 @@ on:
         default: "barcelona"
 permissions:
   contents: write
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -18,35 +17,38 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Build JSON (1 provincia)
-        env:
-          CITY: ${{ github.event.inputs.city }}
+      - name: Build JSON (1 provincia, all map blocks)
+        env: { CITY: ${{ github.event.inputs.city }} }
         run: |
           node - <<'JS'
           const fs = require("fs/promises");
-
-          const CITY = process.env.CITY || "barcelona";
+          const CITY = (process.env.CITY || "barcelona").toLowerCase();
           const BASE = "https://www.consum.es/get-map-list/block_supermercados_en_";
 
-          async function main() {
-            const url = `${BASE}${CITY}/`;
-            const res = await fetch(url, { headers: { Accept: "application/json" } });
-            if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`);
-            let data;
-            try { data = await res.json(); }
-            catch { data = JSON.parse(await res.text()); }
+          async function fetchJson(url){
+            const res = await fetch(url, { headers:{Accept:"application/json"} });
+            if(!res.ok) throw new Error(`HTTP ${res.status} ${url}`);
+            try { return await res.json(); } catch { return JSON.parse(await res.text()); }
+          }
 
-            const mapRec = data?.[0]?.settings?.geofield_google_map;
-            const firstKey = mapRec ? Object.keys(mapRec)[0] : null;
-            const features = firstKey ? (mapRec[firstKey]?.data?.features || []) : [];
+          (async ()=>{
+            const url = `${BASE}${CITY}/`;
+            const data = await fetchJson(url);
+
+            // Unir TODAS las claves del mapa, no solo la primera
+            const maps = data?.[0]?.settings?.geofield_google_map || {};
+            let features = [];
+            for(const k of Object.keys(maps)){
+              const f = maps[k]?.data?.features;
+              if(Array.isArray(f)) features = features.concat(f);
+            }
+            console.error(`debug: maps=${Object.keys(maps).length} features=${features.length}`);
 
             const items = features
-              .filter(f => String(f?.properties?.icon || "").includes("charter"))
-              .map(f => {
-                const p = f.properties || {};
-                const d = p.data || {};
-                const c = (f.geometry && f.geometry.coordinates) || [null, null];
-                const href = String(p.description || "").match(/href="([^"]+)"/)?.[1] || null;
+              .filter(f => String(f?.properties?.icon||"").toLowerCase().includes("charter"))
+              .map(f=>{
+                const p=f.properties||{}, d=p.data||{}, c=(f.geometry&&f.geometry.coordinates)||[null,null];
+                const href = String(p.description||"").match(/href="([^"]+)"/)?.[1] || null;
                 return {
                   id: p.entity_id ?? null,
                   name: p.tooltip ?? null,
@@ -59,26 +61,32 @@ jobs:
                 };
               });
 
-            await fs.mkdir("docs", { recursive: true });
+            // dedupe por id o por name|address
+            const seen = new Set();
+            const dedup = items.filter(x=>{
+              const k = x.id ? `id:${x.id}` : `na:${x.name}|${x.address}`;
+              if(seen.has(k)) return false; seen.add(k); return true;
+            });
+
+            await fs.mkdir("docs",{recursive:true});
             await fs.writeFile("docs/charter.json", JSON.stringify({
-              source: "consum.es locator",
-              last_updated: new Date().toISOString(),
-              count: items.length,
-              items
+              source:"consum.es locator",
+              last_updated:new Date().toISOString(),
+              count:dedup.length,
+              items:dedup
             }, null, 2));
 
             await fs.writeFile("docs/charter.geojson", JSON.stringify({
-              type: "FeatureCollection",
-              features: items.map(s => ({
-                type: "Feature",
-                geometry: { type: "Point", coordinates: [s.lon, s.lat] },
-                properties: { id: s.id, name: s.name, address: s.address, province: s.province, url: s.url, ensena: s.ensena }
+              type:"FeatureCollection",
+              features:dedup.map(s=>({
+                type:"Feature",
+                geometry:{ type:"Point", coordinates:[s.lon,s.lat] },
+                properties:{ id:s.id,name:s.name,address:s.address,province:s.province,url:s.url,ensena:s.ensena }
               }))
             }, null, 2));
 
-            console.log(`OK ${CITY}: ${items.length} Charter`);
-          }
-          main().catch(e => { console.error(e); process.exit(1); });
+            console.log(`OK ${CITY}: ${dedup.length} Charter`);
+          })().catch(e=>{ console.error(e); process.exit(1); });
           JS
 
       - name: Commit if changed
