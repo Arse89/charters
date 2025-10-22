@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       city:
-        description: "Filtro de ciudad o provincia (slug o texto). Ej.: barcelona"
+        description: "Filtro de ciudad/provincia (slug o texto). Ej.: barcelona"
         required: false
         default: "barcelona"
 permissions:
@@ -18,7 +18,7 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Build JSON desde sitemap (sin AJAX)
+      - name: Build JSON desde sitemap (robusto, sin AJAX)
         env:
           CITY: ${{ github.event.inputs.city }}
         run: |
@@ -30,134 +30,221 @@ jobs:
           const H = {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "es-ES,es;q=0.9"
+            "Accept-Language": "es-ES,es;q=0.9",
+            "Referer": ORIGIN + "/"
           };
 
-          async function get(u, opt={}) {
-            const r = await fetch(u, { headers: H, ...opt });
+          async function get(u) {
+            const r = await fetch(u, { headers: H });
             const t = await r.text();
             if (!r.ok) throw new Error(`HTTP ${r.status} ${u}\n${t.slice(0,300)}`);
             return t;
           }
-
-          // Extrae <loc> de un sitemap o sitemapindex
-          function parseSitemap(xml){
-            const locs = [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map(m=>m[1].trim());
-            return locs;
+          async function getJson(u) {
+            const r = await fetch(u, { headers: { ...H, Accept: "application/json" } });
+            const t = await r.text();
+            try { return JSON.parse(t); } catch { return null; }
           }
 
-          // Devuelve todas las URLs /supermercados/ desde sitemap(s)
+          function parseSitemap(xml){
+            return [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map(m=>m[1].trim());
+          }
+
           async function collectStoreUrls(){
             const root = await get(`${ORIGIN}/sitemap.xml`);
-            const entries = parseSitemap(root);
-            const sitemapUrls = entries.filter(x => x.includes("sitemap"));
-            let candidates = [];
-            if (sitemapUrls.length) {
-              for (const sm of sitemapUrls) {
-                const xml = await get(sm);
-                candidates.push(...parseSitemap(xml));
+            let locs = parseSitemap(root);
+            // profundiza en sitemaps secundarios si existen
+            if (locs.some(u=>/sitemap.*\.xml/i.test(u))) {
+              const all = [];
+              for (const sm of locs.filter(u=>/sitemap.*\.xml/i.test(u))) {
+                try { all.push(...parseSitemap(await get(sm))); } catch {}
               }
-            } else {
-              candidates = entries;
+              locs = all;
             }
-            // solo páginas del área de supermercados
-            const urls = candidates
-              .filter(u => u.includes("/supermercados/"))
-              // pre-filtro rápido por slug si aparece en la URL
-              .filter(u => u.toLowerCase().includes(CITY) || CITY === "all");
+            // solo fichas de tienda
+            const urls = locs.filter(u => u.includes("/supermercados/"));
             return Array.from(new Set(urls));
           }
 
-          // Intenta hallar el node id en la ficha
+          // --- detectores en HTML de la ficha ---
+          const hasCharterHTML = (html) => {
+            const h = html.toLowerCase();
+            return h.includes(" col-distancia charter") || h.includes("icon_map_charter");
+          };
+
+          function extractJSONLD(html){
+            const blocks = [...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)].map(m=>m[1]);
+            const objs = [];
+            for (const b of blocks) {
+              try {
+                // algunos sitios ponen varios objetos seguidos; intenta parseo por líneas
+                const val = JSON.parse(b);
+                if (Array.isArray(val)) objs.push(...val);
+                else objs.push(val);
+              } catch {
+                // intenta recuperar objetos individuales
+                const parts = b.split(/\n(?=\s*{\s*"@context")/);
+                for (const p of parts) { try { objs.push(JSON.parse(p)); } catch {} }
+              }
+            }
+            return objs;
+          }
+          function geoFromLD(objs){
+            for (const o of objs) {
+              const g = o?.geo || o?.GeoCoordinates || o?.location?.geo;
+              if (g && typeof g.latitude !== "undefined" && typeof g.longitude !== "undefined") {
+                return { lat:+g.latitude, lon:+g.longitude };
+              }
+            }
+            return null;
+          }
+          function nameFromLD(objs){ for (const o of objs) if (o?.name) return String(o.name); return null; }
+          function addrFromLD(objs){
+            for (const o of objs) {
+              const a = o?.address;
+              if (!a) continue;
+              const line = [a?.streetAddress, a?.postalCode, a?.addressLocality, a?.addressRegion].filter(Boolean).join(", ");
+              if (line) return line;
+            }
+            return null;
+          }
+
+          // patrones alternativos para sacar el node id
           function extractNodeId(html){
-            const m = html.match(/geofield-map-node-centro-(\d+)-field-coordenadas/);
-            return m ? m[1] : null;
+            const patterns = [
+              /geofield-map-node-centro-(\d+)-field-coordenadas/,
+              /data-history-node-id=["'](\d+)["']/,
+              /data-nid=["'](\d+)["']/,
+              /"entity_id":"(\d+)"/,
+              /\/node\/(\d+)[^0-9]/ // por si aparece en enlaces internos
+            ];
+            for (const re of patterns) {
+              const m = html.match(re);
+              if (m) return m[1];
+            }
+            return null;
           }
 
-          async function getMapByNodeId(id){
-            const url = `${ORIGIN}/get-map/${id}/`;
-            const r = await fetch(url, { headers: { "Accept": "application/json", ...H } });
-            const text = await r.text();
-            try { return JSON.parse(text); } catch { return null; }
-          }
-
-          function isCharterFeature(f){
-            const icon = String(f?.properties?.icon || "").toLowerCase();
-            const html = String(f?.properties?.description || "").toLowerCase();
-            return icon.includes("icon_map_charter") || html.includes(" charter");
+          function charterFromMapJSON(json){
+            const maps = json?.[0]?.settings?.geofield_google_map || {};
+            const feats = Object.values(maps).flatMap(b => b?.data?.features || []);
+            const c = feats.find(f => {
+              const icon = String(f?.properties?.icon || "").toLowerCase();
+              const html = String(f?.properties?.description || "").toLowerCase();
+              return icon.includes("icon_map_charter") || html.includes(" charter");
+            });
+            if (!c) return null;
+            const p = c.properties || {};
+            const d = p.data || {};
+            const coord = c.geometry?.coordinates || [null,null];
+            const href = String(p.description||"").match(/href="([^"]+)"/)?.[1] || null;
+            return {
+              id: p.entity_id ?? null,
+              name: p.tooltip ?? null,
+              address: d.field_domicilio ?? null,
+              lat: coord[1] ?? null,
+              lon: coord[0] ?? null,
+              url: href ? new URL(href, ORIGIN).toString() : null
+            };
           }
 
           (async ()=>{
-            await fs.mkdir("docs/debug", { recursive: true });
+            await fs.mkdir("docs/debug", { recursive:true });
 
-            const urls = await collectStoreUrls();
-            console.error(`[SITEMAP] urls prefiltradas=${urls.length}`);
+            const allUrls = await collectStoreUrls();
+            // pre-filtro por ciudad: en URL o en HTML luego
+            const urls = allUrls.filter(u => CITY==="all" ? true : u.toLowerCase().includes(CITY));
+            console.error(`[SITEMAP] candidatas=${allUrls.length} prefiltradas=${urls.length}`);
 
-            const items = [];
+            const out = [];
             for (const u of urls) {
               try {
                 const html = await get(u);
-                // filtro adicional por texto si la URL no contiene el slug
-                if (!u.toLowerCase().includes(CITY)) {
-                  const addrHit = html.toLowerCase().includes(CITY);
-                  if (!addrHit) continue;
+
+                // si la URL no contiene el slug, filtra por contenido
+                if (!u.toLowerCase().includes(CITY) && CITY!=="all" && !html.toLowerCase().includes(CITY)) continue;
+
+                // 1) ¿Es Charter?
+                const isCharter = hasCharterHTML(html);
+                if (!isCharter) continue;
+
+                // 2) Saca nombre/dirección/geo desde JSON-LD si existe
+                const ld = extractJSONLD(html);
+                const nameLD = nameFromLD(ld);
+                const addrLD = addrFromLD(ld);
+                const geoLD = geoFromLD(ld);
+
+                let item = {
+                  id: null,
+                  name: nameLD || null,
+                  address: addrLD || null,
+                  lat: geoLD?.lat ?? null,
+                  lon: geoLD?.lon ?? null,
+                  url: u,
+                  ensena: "Charter"
+                };
+
+                // 3) Si faltan coords, intenta get-map/<id>
+                if (item.lat===null || item.lon===null) {
+                  const nid = extractNodeId(html);
+                  if (nid) {
+                    const mapJson = await getJson(`${ORIGIN}/get-map/${nid}/`);
+                    const fromMap = charterFromMapJSON(mapJson);
+                    if (fromMap) {
+                      item = {
+                        id: fromMap.id || nid,
+                        name: item.name || fromMap.name || null,
+                        address: item.address || fromMap.address || null,
+                        lat: fromMap.lat,
+                        lon: fromMap.lon,
+                        url: fromMap.url || u,
+                        ensena: "Charter"
+                      };
+                    } else {
+                      item.id = nid;
+                    }
+                  }
                 }
-                const id = extractNodeId(html);
-                if (!id) continue;
 
-                const json = await getMapByNodeId(id);
-                const feats = json?.[0]?.settings?.geofield_google_map;
-                const all = feats ? Object.values(feats).flatMap(b => b?.data?.features || []) : [];
-                const charter = all.find(isCharterFeature);
-                if (!charter) continue;
+                // 4) Si aún no hay coordenadas, intenta regex POINT en HTML
+                if (item.lat===null || item.lon===null) {
+                  const m = html.match(/field_coordenadas["']?\s*:\s*["']?POINT\s*\(([-\d\.]+)\s+([-\d\.]+)\)/i);
+                  if (m) { item.lon = +m[1]; item.lat = +m[2]; }
+                }
 
-                const p = charter.properties || {};
-                const d = p.data || {};
-                const c = charter.geometry?.coordinates || [null,null];
-                const href = String(p.description||"").match(/href="([^"]+)"/)?.[1] || u;
+                // 5) guarda si tiene al menos nombre o dirección
+                if (item.name || item.address) out.push(item);
 
-                // Provincia y ciudad aproximadas desde la página
-                const addrLine = (d.field_domicilio || "");
-                items.push({
-                  id: p.entity_id || id,
-                  name: p.tooltip || null,
-                  address: addrLine,
-                  url: new URL(href, ORIGIN).toString(),
-                  lat: c[1] ?? null,
-                  lon: c[0] ?? null,
-                  ensena: "Charter",
-                  source_page: u
-                });
               } catch (e) {
-                console.error(`[ERR] ${u} ${e.message}`);
+                console.error(`[ERR] ${u} :: ${e.message}`);
               }
             }
 
-            // dedupe por id o name+address
+            // dedupe
             const seen = new Set();
-            const dedup = items.filter(x=>{
+            const items = out.filter(x=>{
               const k = x.id ? `id:${x.id}` : `na:${x.name}|${x.address}`;
               if (seen.has(k)) return false; seen.add(k); return true;
             });
 
             await fs.writeFile("docs/charter.json", JSON.stringify({
-              source: "consum.es (sitemap + get-map/<id>)",
+              source: "consum.es (sitemap + ficha + JSON-LD + get-map fallback)",
               city_filter: CITY,
               last_updated: new Date().toISOString(),
-              count: dedup.length,
-              items: dedup
+              count: items.length,
+              items
             }, null, 2));
 
             await fs.writeFile("docs/charter.geojson", JSON.stringify({
               type: "FeatureCollection",
-              features: dedup.map(s => ({
+              features: items.map(s => ({
                 type: "Feature",
                 geometry: { type: "Point", coordinates: [s.lon, s.lat] },
-                properties: { id: s.id, name: s.name, address: s.address, url: s.url, ensena: s.ensena }
+                properties: { id: s.id, name: s.name, address: s.address, url: s.url, ensena: "Charter" }
               }))
             }, null, 2));
 
-            console.error(`[END] total=${dedup.length}`);
+            console.error(`[END] total=${items.length}`);
             console.log("OK");
           })().catch(e=>{ console.error(e); process.exit(1); });
           JS
