@@ -3,11 +3,10 @@ on:
   workflow_dispatch:
     inputs:
       city:
-        description: "Filtro texto (p.ej. barcelona). Usa 'all' para todo."
+        description: "Provincia slug (p. ej. barcelona)"
         required: false
-        default: "all"
-permissions:
-  contents: write
+        default: "barcelona"
+permissions: { contents: write }
 
 jobs:
   build:
@@ -15,178 +14,128 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
+        with: { node-version: "20" }
 
-      - name: Build JSON desde sitemap → fichas → drupalSettings (sin AJAX)
-        env:
-          CITY: ${{ github.event.inputs.city }}
+      - name: Build JSON (get-map-list paginado, sin AJAX)
+        env: { CITY: ${{ github.event.inputs.city }} }
         run: |
           node - <<'JS'
           const fs = require("fs/promises");
+
+          const CITY = (process.env.CITY || "barcelona").toLowerCase();
           const ORIGIN = "https://www.consum.es";
-          const CITY = (process.env.CITY || "all").toLowerCase();
-          const UA = {
+          const HEAD = {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
             "Accept-Language": "es-ES,es;q=0.9",
-            "Referer": ORIGIN + "/"
+            "Referer": `${ORIGIN}/supermercados/${CITY}/`
           };
 
-          const sleep = ms => new Promise(r=>setTimeout(r,ms));
-          const norm = s => (s||"").normalize("NFD").replace(/\p{Diacritic}/gu,"").toLowerCase();
-
-          async function get(u){
-            const r = await fetch(u, { headers: UA });
+          async function getJSON(u){
+            const r = await fetch(u, { headers: HEAD });
             const t = await r.text();
             if (!r.ok) throw new Error(`HTTP ${r.status} ${u}\n${t.slice(0,300)}`);
-            return t;
-          }
-          function parseSitemap(xml){
-            return [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map(m=>m[1].trim());
+            try { return JSON.parse(t); } catch { throw new Error(`No JSON en ${u}`); }
           }
 
-          // 1) Saca TODAS las URLs bajo /supermercados/ (fichas y listados)
-          async function collectSuperUrls(){
-            const root = await get(`${ORIGIN}/sitemap.xml`);
-            let locs = parseSitemap(root);
-            const children = locs.filter(u=>/sitemap.*\.xml/i.test(u));
-            if (children.length){
-              const all=[]; for (const sm of children){ try{ all.push(...parseSitemap(await get(sm))); }catch{} }
-              locs = all;
-            }
-            return Array.from(new Set(locs.filter(u=>u.includes("/supermercados/"))));
-          }
-
-          // 2) Extrae drupalSettings de una ficha
-          function extractDrupalSettings(html){
-            // preferido: <script data-drupal-selector="drupal-settings-json"> ... </script>
-            const m1 = html.match(/<script[^>]+data-drupal-selector=["']drupal-settings-json["'][^>]*>([\s\S]*?)<\/script>/i);
-            if (m1) { try { return JSON.parse(m1[1]); } catch {} }
-            // fallback: window.drupalSettings = {...};
-            const m2 = html.match(/drupalSettings\s*=\s*({[\s\S]*?})\s*;?\s*<\/script>/i);
-            if (m2) { try { return JSON.parse(m2[1]); } catch {} }
-            return null;
-          }
-
-          // 3) De drupalSettings → features del mapa (si hay)
-          function featuresFromSettings(ds){
-            const maps = ds?.geofield_google_map || ds?.settings?.geofield_google_map || {};
-            return Object.values(maps).flatMap(m => m?.data?.features || []);
-          }
-
-          // 4) Detecta Charter por icono o clase
-          function isCharterProp(p={}){
+          const isCharter = (p={})=>{
             const icon = String(p.icon||"").toLowerCase();
             const html = String(p.description||"").toLowerCase();
             return icon.includes("icon_map_charter") || html.includes(" charter");
+          };
+
+          function featuresFromSettings(settings){
+            const maps = settings?.geofield_google_map || {};
+            return Object.values(maps).flatMap(m => m?.data?.features ?? []);
           }
 
-          // 5) Intenta atar el feature a la propia ficha por URL
-          function matchFeatureToPage(features, pagePath){
-            const rel = pagePath.endsWith("/") ? pagePath : pagePath + "/";
-            // prioridad: el feature cuya descripción tiene un <a href="...esta ficha...">
-            const byHref = features.find(f => String(f?.properties?.description||"").includes(`href="${rel}"`));
-            if (byHref) return byHref;
-            // si solo hay uno, usa ese
-            if (features.length === 1) return features[0];
-            // si hay varios, usa cualquiera que sea Charter
-            const anyCharter = features.find(f => isCharterProp(f?.properties));
-            return anyCharter || features[0];
+          async function collectDisplay(displayId){
+            let all = [];
+            const seen = new Set(); // entity_id ya vistos
+            for (let page=0; page<60; page++){
+              const url = `${ORIGIN}/get-map-list/${displayId}/?page=${page}`;
+              let json;
+              try { json = await getJSON(url); }
+              catch(e){ if(page===0) console.error(`[WARN] ${displayId} p${page}: ${e.message}`); break; }
+              const settings = json?.[0]?.settings || {};
+              const feats = featuresFromSettings(settings);
+              const newOnes = [];
+              for (const f of feats){
+                const id = f?.properties?.entity_id || `${f?.properties?.tooltip}|${f?.properties?.data?.field_domicilio||""}`;
+                if (!id) continue;
+                if (seen.has(id)) continue;
+                seen.add(id);
+                newOnes.push(f);
+              }
+              const charters = newOnes.filter(f => isCharter(f.properties));
+              console.error(`[FEED] ${displayId} p${page} feats=${feats.length} new=${newOnes.length} charter_new=${charters.length}`);
+              all = all.concat(newOnes);
+              // corte: si no hay nuevos en esta página, asumimos fin
+              if (newOnes.length === 0) break;
+              // seguridad: si una página trae 0 feats, fin
+              if (feats.length === 0) break;
+            }
+            return all;
           }
 
           (async ()=>{
-            await fs.mkdir("docs", {recursive:true});
-            const urls = await collectSuperUrls();
+            const displays = [
+              `block_supermercados_en_${CITY}`,
+              `attachment_supermercados_en_${CITY}`
+            ];
 
-            // Filtra a fichas reales aproximando: 2º segmento tras /supermercados/ que NO parezca listado.
-            // Aun así, si cuela algún listado, se descartará porque no tendrá drupalSettings con features de tienda.
-            const candidates = urls.filter(u=>{
-              try{
-                const parts = new URL(u).pathname.replace(/^\/|\/$/g,"").split("/");
-                const i = parts.indexOf("supermercados");
-                const seg = parts[i+1] || "";
-                if (!seg) return false;
-                // heurística: listado por provincia suele ser un solo segmento "barcelona", "valencia", etc.
-                // fichas llevan nombres largos con guiones.
-                return seg.includes("-") || seg.length > 12;
-              }catch{ return false; }
-            });
+            let allFeats = [];
+            for (const d of displays){
+              const feats = await collectDisplay(d);
+              allFeats = allFeats.concat(feats);
+            }
 
-            // Aplica filtro CITY por URL o lo diferimos a contenido
-            const pre = CITY==="all" ? candidates : candidates.filter(u => norm(u).includes(norm(CITY)));
-            console.error(`[SITEMAP] fichas=${candidates.length} prefiltradas=${pre.length}`);
-
-            const items=[];
-            let fetched=0;
-            for (const u of pre){
-              try{
-                const html = await get(u);
-                const ds = extractDrupalSettings(html);
-                if (!ds) continue;
-                const feats = featuresFromSettings(ds);
-                if (!feats.length) continue;
-
-                const pagePath = new URL(u).pathname;
-                const feat = matchFeatureToPage(feats, pagePath);
-                if (!feat) continue;
-
-                const p = feat.properties || {};
+            // filtra Charter y normaliza
+            const itemsRaw = allFeats
+              .filter(f => isCharter(f?.properties))
+              .map(f => {
+                const p = f.properties || {};
                 const d = p.data || {};
-                const c = feat.geometry?.coordinates || [null,null];
-
-                // ciudad/provincia por contenido si CITY != all
-                if (CITY!=="all"){
-                  const blob = `${u}\n${p.tooltip||""}\n${d.field_domicilio||""}\n${p.description||""}`;
-                  if (!norm(blob).includes(norm(CITY))) continue;
-                }
-
-                // Solo Charter
-                if (!isCharterProp(p)) continue;
-
-                const href = String(p.description||"").match(/href="([^"]+)"/)?.[1] || u;
-                items.push({
+                const c = f.geometry?.coordinates || [null,null];
+                const href = String(p.description||"").match(/href="([^"]+)"/)?.[1] || null;
+                return {
                   id: p.entity_id ?? null,
                   name: p.tooltip || null,
                   address: d.field_domicilio || null,
+                  province: CITY,
                   lat: c[1] ?? null,
                   lon: c[0] ?? null,
-                  url: new URL(href, ORIGIN).toString(),
-                  ensena: "Charter",
-                  source: u
-                });
-                fetched++;
-                if (fetched % 25 === 0) await sleep(150);
-              }catch(e){
-                // silencioso para robustez
-              }
-            }
+                  url: href ? new URL(href, ORIGIN).toString() : null,
+                  ensena: "Charter"
+                };
+              });
 
-            // dedupe
+            // dedupe final
             const seen = new Set();
-            const out = items.filter(x=>{
+            const items = itemsRaw.filter(x=>{
               const k = x.id ? `id:${x.id}` : `na:${x.name}|${x.address}`;
               if (seen.has(k)) return false; seen.add(k); return true;
             });
 
+            await fs.mkdir("docs", { recursive:true });
             await fs.writeFile("docs/charter.json", JSON.stringify({
-              source: "consum.es (sitemap→ficha→drupalSettings)",
-              city_filter: CITY,
+              source: "consum.es (get-map-list ?page=N)",
+              city: CITY,
               last_updated: new Date().toISOString(),
-              count: out.length,
-              items: out
+              count: items.length,
+              items
             }, null, 2));
 
             await fs.writeFile("docs/charter.geojson", JSON.stringify({
               type:"FeatureCollection",
-              features: out.map(s=>({
+              features: items.map(s=>({
                 type:"Feature",
                 geometry:{ type:"Point", coordinates:[s.lon,s.lat] },
-                properties:{ id:s.id,name:s.name,address:s.address,url:s.url,ensena:s.ensena }
+                properties:{ id:s.id,name:s.name,address:s.address,province:s.province,url:s.url,ensena:s.ensena }
               }))
             }, null, 2));
 
-            console.error(`[END] total=${out.length}`);
+            console.error(`[END] total_charter=${items.length}`);
             console.log("OK");
           })().catch(e=>{ console.error(e); process.exit(1); });
           JS
@@ -197,8 +146,8 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add docs
-            git commit -m "mvp drupalSettings: ${CITY:-all} [skip ci]" || true
+            git commit -m "mvp: ${CITY:-barcelona} Charter (get-map-list paginado) [skip ci]" || true
             git push
           else
             echo "Sin cambios"
-          fi 
+          fi
