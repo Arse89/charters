@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       city:
-        description: "Provincia slug (ej.: barcelona, valencia, alicante)"
+        description: "Filtro de ciudad o provincia (slug o texto). Ej.: barcelona"
         required: false
         default: "barcelona"
 permissions:
@@ -18,153 +18,131 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Build JSON + GEOJSON (paginado, multi-bloque, debug)
+      - name: Build JSON desde sitemap (sin AJAX)
         env:
           CITY: ${{ github.event.inputs.city }}
         run: |
           node - <<'JS'
           const fs = require("fs/promises");
-
-          const CITY   = (process.env.CITY || "barcelona").toLowerCase();
           const ORIGIN = "https://www.consum.es";
-          const FEED   = `${ORIGIN}/get-map-list/block_supermercados_en_${CITY}/`;
-          const REFERER= `${ORIGIN}/supermercados/${CITY}/`;
+          const CITY = (process.env.CITY || "barcelona").toLowerCase();
 
           const H = {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125 Safari/537.36",
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Accept-Language": "es-ES,es;q=0.9",
-            "Referer": REFERER
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "es-ES,es;q=0.9"
           };
 
-          async function getText(u, opt={}) {
+          async function get(u, opt={}) {
             const r = await fetch(u, { headers: H, ...opt });
+            const t = await r.text();
+            if (!r.ok) throw new Error(`HTTP ${r.status} ${u}\n${t.slice(0,300)}`);
+            return t;
+          }
+
+          // Extrae <loc> de un sitemap o sitemapindex
+          function parseSitemap(xml){
+            const locs = [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map(m=>m[1].trim());
+            return locs;
+          }
+
+          // Devuelve todas las URLs /supermercados/ desde sitemap(s)
+          async function collectStoreUrls(){
+            const root = await get(`${ORIGIN}/sitemap.xml`);
+            const entries = parseSitemap(root);
+            const sitemapUrls = entries.filter(x => x.includes("sitemap"));
+            let candidates = [];
+            if (sitemapUrls.length) {
+              for (const sm of sitemapUrls) {
+                const xml = await get(sm);
+                candidates.push(...parseSitemap(xml));
+              }
+            } else {
+              candidates = entries;
+            }
+            // solo páginas del área de supermercados
+            const urls = candidates
+              .filter(u => u.includes("/supermercados/"))
+              // pre-filtro rápido por slug si aparece en la URL
+              .filter(u => u.toLowerCase().includes(CITY) || CITY === "all");
+            return Array.from(new Set(urls));
+          }
+
+          // Intenta hallar el node id en la ficha
+          function extractNodeId(html){
+            const m = html.match(/geofield-map-node-centro-(\d+)-field-coordenadas/);
+            return m ? m[1] : null;
+          }
+
+          async function getMapByNodeId(id){
+            const url = `${ORIGIN}/get-map/${id}/`;
+            const r = await fetch(url, { headers: { "Accept": "application/json", ...H } });
             const text = await r.text();
-            if (!r.ok) throw new Error(`HTTP ${r.status} ${u}\n${text.slice(0,400)}`);
-            return text;
-          }
-          async function getJSON(u, opt={}) {
-            const text = await getText(u, opt);
-            try { return { json: JSON.parse(text), raw: text }; }
-            catch { return { json: null, raw: text }; }
+            try { return JSON.parse(text); } catch { return null; }
           }
 
-          const isCharter = (p={}) => {
-            const icon = String(p.icon||"").toLowerCase();
-            const html = String(p.description||"").toLowerCase();
-            // icono específico o clase "charter" en la tarjeta HTML
+          function isCharterFeature(f){
+            const icon = String(f?.properties?.icon || "").toLowerCase();
+            const html = String(f?.properties?.description || "").toLowerCase();
             return icon.includes("icon_map_charter") || html.includes(" charter");
-          };
-
-          function collectFromSettings(settings){
-            const maps = settings?.geofield_google_map || {};
-            const blocks = Object.values(maps);
-            const feats = blocks.flatMap(b => b?.data?.features ?? []);
-            return { mapBlocks: Object.keys(maps).length, feats };
           }
 
-          (async () => {
+          (async ()=>{
             await fs.mkdir("docs/debug", { recursive: true });
 
-            // 1) Carga inicial
-            const init = await getJSON(FEED);
-            await fs.writeFile(`docs/debug/${CITY}-init.raw.txt`, init.raw);
-            if (!init.json) throw new Error("El feed inicial no es JSON. Mira docs/debug/*-init.raw.txt");
+            const urls = await collectStoreUrls();
+            console.error(`[SITEMAP] urls prefiltradas=${urls.length}`);
 
-            const data0 = init.json;
-            await fs.writeFile(`docs/debug/${CITY}-init.json`, JSON.stringify(data0, null, 2));
+            const items = [];
+            for (const u of urls) {
+              try {
+                const html = await get(u);
+                // filtro adicional por texto si la URL no contiene el slug
+                if (!u.toLowerCase().includes(CITY)) {
+                  const addrHit = html.toLowerCase().includes(CITY);
+                  if (!addrHit) continue;
+                }
+                const id = extractNodeId(html);
+                if (!id) continue;
 
-            const set0  = data0?.[0]?.settings || {};
-            const ajaxViews = set0?.views?.ajaxViews || {};
-            const ajaxPath  = set0?.views?.ajax_path || "/views/ajax/";
-            const libs  = set0?.ajaxPageState?.libraries || "";
-            const theme = set0?.ajaxPageState?.theme || "";
-            const ajaxURL = new URL(ajaxPath, ORIGIN).toString();
+                const json = await getMapByNodeId(id);
+                const feats = json?.[0]?.settings?.geofield_google_map;
+                const all = feats ? Object.values(feats).flatMap(b => b?.data?.features || []) : [];
+                const charter = all.find(isCharterFeature);
+                if (!charter) continue;
 
-            let { mapBlocks: b0, feats: f0 } = collectFromSettings(set0);
-            console.error(`[INIT] path=${ajaxPath} blocks=${b0} raw=${f0.length} charter=${f0.filter(x=>isCharter(x.properties)).length}`);
+                const p = charter.properties || {};
+                const d = p.data || {};
+                const c = charter.geometry?.coordinates || [null,null];
+                const href = String(p.description||"").match(/href="([^"]+)"/)?.[1] || u;
 
-            let featsAll = f0.slice();
-
-            // 2) views/ajax con paginación page=0..N
-            for (const [domId, v] of Object.entries(ajaxViews)) {
-              let page = 0;
-              for (;; page++) {
-                const form = new URLSearchParams({
-                  view_name: v.view_name || "supermarkets",
-                  view_display_id: v.view_display_id || "",
-                  view_args: v.view_args || "",
-                  view_path: v.view_path || "",
-                  view_base_path: v.view_base_path || "supermercados",
-                  view_dom_id: v.view_dom_id || "",
-                  pager_element: String(v.pager_element ?? 0),
-                  page: String(page),
-                  per_page: "50", // si la vista lo soporta, mejor
-                  "ajax_page_state[libraries]": libs,
-                  "ajax_page_state[theme]": theme
+                // Provincia y ciudad aproximadas desde la página
+                const addrLine = (d.field_domicilio || "");
+                items.push({
+                  id: p.entity_id || id,
+                  name: p.tooltip || null,
+                  address: addrLine,
+                  url: new URL(href, ORIGIN).toString(),
+                  lat: c[1] ?? null,
+                  lon: c[0] ?? null,
+                  ensena: "Charter",
+                  source_page: u
                 });
-
-                const r = await fetch(ajaxURL, {
-                  method: "POST",
-                  headers: {
-                    ...H,
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                    "X-Requested-With": "XMLHttpRequest"
-                  },
-                  body: form.toString()
-                });
-
-                const raw = await r.text();
-                await fs.writeFile(`docs/debug/${CITY}-ajax-${domId}-p${page}.raw.txt`, raw);
-
-                let resp;
-                try { resp = JSON.parse(raw); } catch { resp = null; }
-                if (!resp || !Array.isArray(resp)) { console.error(`[AJAX] ${v.view_display_id} p${page} sin JSON`); break; }
-
-                const cmd = resp.find(x => x?.command === "settings");
-                const setX = cmd?.settings;
-                if (!setX) { console.error(`[AJAX] ${v.view_display_id} p${page} sin settings`); break; }
-
-                const { mapBlocks, feats } = collectFromSettings(setX);
-                const n = feats.length;
-                console.error(`[AJAX] ${v.view_display_id} p${page} blocks=${mapBlocks} raw=${n} charter=${feats.filter(x=>isCharter(x.properties)).length}`);
-
-                if (n === 0) break; // fin paginación
-
-                featsAll = featsAll.concat(feats);
-                if (page > 20) { console.error("[AJAX] corte preventivo >20 páginas"); break; }
+              } catch (e) {
+                console.error(`[ERR] ${u} ${e.message}`);
               }
             }
 
-            // 3) Normaliza + filtra + dedupe
-            const items = featsAll
-              .filter(f => isCharter(f.properties))
-              .map(f => {
-                const p = f.properties || {};
-                const d = p.data || {};
-                const c = (f.geometry?.coordinates) || [null, null];
-                const href = String(p.description || "").match(/href="([^"]+)"/)?.[1] || null;
-                return {
-                  id: p.entity_id ?? null,
-                  name: p.tooltip ?? null,
-                  address: d.field_domicilio ?? null,
-                  province: CITY,
-                  lat: c[1] ?? null,
-                  lon: c[0] ?? null,
-                  url: href ? new URL(href, ORIGIN).toString() : null,
-                  ensena: "Charter"
-                };
-              });
-
+            // dedupe por id o name+address
             const seen = new Set();
-            const dedup = items.filter(x => {
+            const dedup = items.filter(x=>{
               const k = x.id ? `id:${x.id}` : `na:${x.name}|${x.address}`;
               if (seen.has(k)) return false; seen.add(k); return true;
             });
 
-            // 4) Salidas
             await fs.writeFile("docs/charter.json", JSON.stringify({
-              source: "consum.es (get-map-list + views/ajax paginado)",
+              source: "consum.es (sitemap + get-map/<id>)",
+              city_filter: CITY,
               last_updated: new Date().toISOString(),
               count: dedup.length,
               items: dedup
@@ -175,13 +153,13 @@ jobs:
               features: dedup.map(s => ({
                 type: "Feature",
                 geometry: { type: "Point", coordinates: [s.lon, s.lat] },
-                properties: { id: s.id, name: s.name, address: s.address, province: s.province, url: s.url, ensena: s.ensena }
+                properties: { id: s.id, name: s.name, address: s.address, url: s.url, ensena: s.ensena }
               }))
             }, null, 2));
 
-            console.error(`[END] totalRaw=${featsAll.length} totalCharter=${dedup.length}`);
+            console.error(`[END] total=${dedup.length}`);
             console.log("OK");
-          })().catch(e => { console.error(e); process.exit(1); });
+          })().catch(e=>{ console.error(e); process.exit(1); });
           JS
 
       - name: Commit if changed
@@ -190,7 +168,7 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add docs
-            git commit -m "mvp: ${CITY:-barcelona} Charter [skip ci]" || true
+            git commit -m "mvp sitemap: ${CITY:-barcelona} [skip ci]" || true
             git push
           else
             echo "Sin cambios"
