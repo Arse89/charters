@@ -1,7 +1,16 @@
 {
-  "source": "consum.es (sitemap + ficha + JSON-LD + get-map fallback)",
+  "source": "consum.es (sitemap→ficha→JSON-LD + get-map fallback)",
   "city_filter": "barcelona",
-  "last_updated": "2025-10-22T01:52:57.266Z",
+  "totals": {
+    "candidates": 1011,
+    "kept": 0,
+    "withLD": 0,
+    "withGeo": 0,
+    "viaMap": 0,
+    "charter": 0,
+    "out": 0
+  },
+  "last_updated": "2025-10-22T02:02:13.820Z",
   "count": 0,
   "items": []
 }
