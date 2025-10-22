@@ -1,6 +1,6 @@
 {
-  "source": "consum.es (get-map-list + views/ajax)",
-  "last_updated": "2025-10-22T01:13:41.267Z",
+  "source": "consum.es (get-map-list + views/ajax paginado)",
+  "last_updated": "2025-10-22T01:24:36.171Z",
   "count": 1,
   "items": [
     {
