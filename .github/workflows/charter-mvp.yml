@@ -1,6 +1,11 @@
 name: charter-mvp
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      city:
+        description: "Provincia slug (p. ej. barcelona)"
+        required: false
+        default: "barcelona"
 permissions:
   contents: write
 
@@ -10,25 +15,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
+        with: { node-version: "20" }
 
-      - name: Fetch Charter (barcelona · page 0)
+      - name: Build JSON (get-map-list paginado)
+        env: { CITY: ${{ github.event.inputs.city }} }
         run: |
           node - <<'JS'
           const fs = require("fs/promises");
-
           const ORIGIN = "https://www.consum.es";
-          const DISPLAY_IDS = [
-            "block_supermercados_en_barcelona",
-            "attachment_supermercados_en_barcelona"
+          const CITY = (process.env.CITY || "barcelona").toLowerCase();
+          const DISPLAYS = [
+            `block_supermercados_en_${CITY}`,
+            `attachment_supermercados_en_${CITY}`
           ];
-
           const H = {
             "User-Agent":"Mozilla/5.0",
             "Accept":"application/json, text/javascript, */*; q=0.01",
             "Accept-Language":"es-ES,es;q=0.9",
-            "Referer": `${ORIGIN}/supermercados/barcelona/`
+            "Referer": `${ORIGIN}/supermercados/${CITY}/`
           };
 
           const isCharter = (p={})=>{
@@ -36,36 +40,43 @@ jobs:
             const html = String(p.description||"").toLowerCase();
             return icon.includes("icon_map_charter") || html.includes(" charter");
           };
-
-          const featuresFrom = (json)=>{
-            const st = json?.[0]?.settings || {};
+          const featuresFrom = (j)=>{
+            const st = j?.[0]?.settings || {};
             const maps = st.geofield_google_map || {};
-            return Object.values(maps).flatMap(m=>m?.data?.features||[]);
+            return Object.values(maps).flatMap(m => m?.data?.features || []);
           };
-
-          async function getJSON(url){
+          async function fetchPage(display, page){
+            const url = `${ORIGIN}/get-map-list/${display}/?page=${page}`;
             const r = await fetch(url, { headers: H });
             const t = await r.text();
             if (!r.ok) throw new Error(`HTTP ${r.status} ${url}\n${t.slice(0,200)}`);
-            let j; try { j = JSON.parse(t); } catch(e){ throw new Error(`No JSON en ${url}`); }
-            return j;
+            return JSON.parse(t);
           }
 
           (async ()=>{
-            let featsAll = [];
-            for (const id of DISPLAY_IDS){
-              const url = `${ORIGIN}/get-map-list/${id}/?page=0`;
-              try{
-                const j = await getJSON(url);
-                const f = featuresFrom(j);
-                console.error(`[FEED] ${id} p0 -> ${f.length} features`);
-                featsAll = featsAll.concat(f);
-              }catch(e){
-                console.error(`[ERR] ${id}: ${e.message}`);
+            const seen = new Set();
+            let all = [];
+            for (const d of DISPLAYS){
+              for (let p=0; p<60; p++){
+                let json;
+                try { json = await fetchPage(d, p); } catch(e){ if(p===0) console.error(`[WARN] ${d} p${p}: ${e.message}`); break; }
+                const feats = featuresFrom(json);
+                // nuevos por entity_id o por nombre+dir
+                let newFeats = [];
+                for (const f of feats){
+                  const id = f?.properties?.entity_id || `${f?.properties?.tooltip||""}|${f?.properties?.data?.field_domicilio||""}`;
+                  if (!id || seen.has(id)) continue;
+                  seen.add(id);
+                  newFeats.push(f);
+                }
+                const cNew = newFeats.filter(f=>isCharter(f.properties)).length;
+                console.error(`[FEED] ${d} p${p} feats=${feats.length} new=${newFeats.length} charter_new=${cNew}`);
+                all = all.concat(newFeats);
+                if (feats.length === 0 || newFeats.length === 0) break; // fin
               }
             }
 
-            const items = featsAll
+            const items = all
               .filter(f=>isCharter(f.properties))
               .map(f=>{
                 const p=f.properties||{}, d=p.data||{}, c=f.geometry?.coordinates||[null,null];
@@ -74,6 +85,7 @@ jobs:
                   id: p.entity_id ?? null,
                   name: p.tooltip || null,
                   address: d.field_domicilio || null,
+                  province: CITY,
                   lat: c[1] ?? null,
                   lon: c[0] ?? null,
                   url: href ? new URL(href, ORIGIN).toString() : null,
@@ -83,12 +95,21 @@ jobs:
 
             await fs.mkdir("docs", { recursive:true });
             await fs.writeFile("docs/charter.json", JSON.stringify({
-              source: "get-map-list (barcelona, page=0)",
+              source: "get-map-list (?page=N)",
+              city: CITY,
+              last_updated: new Date().toISOString(),
               count: items.length,
               items
             }, null, 2));
-
-            console.error(`[END] charter=${items.length}`);
+            await fs.writeFile("docs/charter.geojson", JSON.stringify({
+              type:"FeatureCollection",
+              features: items.map(s=>({
+                type:"Feature",
+                geometry:{ type:"Point", coordinates:[s.lon,s.lat] },
+                properties:{ id:s.id,name:s.name,address:s.address,province:s.province,url:s.url,ensena:s.ensena }
+              }))
+            }, null, 2));
+            console.error(`[END] total_charter=${items.length}`);
             console.log("OK");
           })().catch(e=>{ console.error(e); process.exit(1); });
           JS
@@ -97,6 +118,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/charter.json || true
-          git commit -m "mvp: barcelona p0" || true
-          git push || true 
+          git add docs/charter.json docs/charter.geojson || true
+          git commit -m "mvp: ${CITY:-barcelona} paginado [skip ci]" || true
+          git push || true
