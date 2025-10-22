@@ -10,129 +10,105 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
+        with: { node-version: "20" }
+      - name: Install deps
+        run: npm i puppeteer@22
 
-      - name: Barcelona → listar fichas → get-map/<id> → Charter JSON
+      - name: Scrape Charter (Barcelona, headless)
         run: |
           node - <<'JS'
           const fs = require("fs/promises");
-          const BASE = "https://www.consum.es";
-          const LIST_URL = (p) => `${BASE}/supermercados/barcelona/?page=${p}`;
-          const UA = {
-            "User-Agent":"Mozilla/5.0",
-            "Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language":"es-ES,es;q=0.9",
-            "Referer": `${BASE}/supermercados/barcelona/`
-          };
+          const puppeteer = require("puppeteer");
+          const ORIGIN = "https://www.consum.es";
+          const START = `${ORIGIN}/supermercados/barcelona/`;
 
-          async function getText(u){
-            const r = await fetch(u, { headers: UA });
-            const t = await r.text();
-            if (!r.ok) throw new Error(`HTTP ${r.status} ${u}\n${t.slice(0,200)}`);
-            return t;
-          }
-          async function getJSON(u){
-            const r = await fetch(u, { headers: { ...UA, Accept:"application/json" }});
-            const t = await r.text();
-            try { return JSON.parse(t); } catch { return null; }
-          }
+          const norm = s => (s||"").normalize("NFD").replace(/\p{Diacritic}/gu,"").toLowerCase();
 
-          // 1) Recorre páginas de listado y recoge enlaces a fichas
-          async function collectStoreUrls(){
-            const seen = new Set(), urls=[];
-            for (let p=0; p<50; p++){
-              let html; try { html = await getText(LIST_URL(p)); } catch(e){ break; }
-              // extrae /supermercados/<slug>/
-              const links = [...html.matchAll(/href="(\/supermercados\/[a-z0-9-]+\/)"/g)].map(m=>m[1]);
-              let newCount = 0;
-              for (const href of links){
-                if (!seen.has(href)){ seen.add(href); urls.push(new URL(href, BASE).toString()); newCount++; }
-              }
-              console.error(`[LIST] page=${p} links=${links.length} new=${newCount}`);
-              if (newCount === 0) break; // no hay más
+          async function autoScroll(page, max=40, wait=1200){
+            let last = 0;
+            for (let i=0;i<max;i++){
+              await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+              await page.waitForTimeout(wait);
+              const cnt = await page.$$eval('article.node--type-supermarket-map', els => els.length);
+              if (cnt <= last) break;
+              last = cnt;
             }
-            return urls;
-          }
-
-          // 2) Extrae node id de la ficha
-          function extractNodeId(html){
-            const pats = [
-              /<link[^>]+rel=["']shortlink["'][^>]+href=["'][^"']*\/node\/(\d+)["']/i,
-              /data-history-node-id=["'](\d+)["']/i,
-              /data-nid=["'](\d+)["']/i,
-              /"entity_id"\s*:\s*"(\d+)"/i
-            ];
-            for (const re of pats){ const m = html.match(re); if (m) return m[1]; }
-            return null;
-          }
-
-          // 3) De get-map/<id> saca Charter y coords
-          function charterFromMap(json){
-            const maps = json?.[0]?.settings?.geofield_google_map || {};
-            const feats = Object.values(maps).flatMap(m=>m?.data?.features||[]);
-            const f = feats.find(x=>{
-              const icon = String(x?.properties?.icon||"").toLowerCase();
-              const desc = String(x?.properties?.description||"").toLowerCase();
-              return icon.includes("icon_map_charter") || desc.includes(" charter");
-            });
-            if (!f) return null;
-            const p=f.properties||{}, d=p.data||{}, c=f.geometry?.coordinates||[null,null];
-            const href = String(p.description||"").match(/href="([^"]+)"/)?.[1] || null;
-            return {
-              id: p.entity_id ?? null,
-              name: p.tooltip || null,
-              address: d.field_domicilio || null,
-              lat: c[1] ?? null,
-              lon: c[0] ?? null,
-              url: href ? new URL(href, BASE).toString() : null
-            };
+            return last;
           }
 
           (async ()=>{
-            const urls = await collectStoreUrls(); // fichas reales en Barcelona
-            console.error(`[LIST] total_fichas=${urls.length}`);
+            const browser = await puppeteer.launch({headless:"new", args:["--no-sandbox","--disable-setuid-sandbox"]});
+            const page = await browser.newPage();
+            await page.setUserAgent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125 Safari/537.36");
+            await page.goto(START, {waitUntil:"domcontentloaded"});
+            const n = await autoScroll(page);
+            console.error(`[SCROLL] tarjetas=${n}`);
 
-            const items = [];
-            for (const u of urls){
+            // extrae tarjetas Charter
+            const cards = await page.$$eval('article.node--type-supermarket-map', els =>
+              els.map(el => {
+                const html = el.innerHTML.toLowerCase();
+                const isCharter = html.includes('col-distancia charter') || html.includes('icon_map_charter');
+                const a = el.querySelector('.supermarket-label a');
+                return { isCharter, url: a ? a.href : null, name: a ? a.textContent.trim() : null };
+              })
+            );
+            const stores = cards.filter(c => c.isCharter && c.url).filter((v,i,a)=>a.findIndex(x=>x.url===v.url)===i);
+            console.error(`[PICK] charter_cards=${stores.length}`);
+
+            // visita cada ficha y completa datos
+            const detail = await browser.newPage();
+            const out = [];
+            for (const s of stores){
               try{
-                const html = await getText(u);
-                // si la propia ficha marca Charter, mantenlo como pista
-                const isCharterHTML = /col-distancia\s+charter/i.test(html) || /icon_map_charter/i.test(html);
-                const nid = extractNodeId(html);
-                if (!nid && !isCharterHTML) continue;
+                await detail.goto(s.url, {waitUntil:"domcontentloaded"});
+                const html = await detail.content();
 
-                let rec = null;
-                if (nid){
-                  const mapJson = await getJSON(`${BASE}/get-map/${nid}/`);
-                  rec = charterFromMap(mapJson);
-                }
-                if (!rec && isCharterHTML){
-                  // sin JSON, pero la ficha lo marca como Charter; guarda sin coords
-                  rec = { id: nid||null, name: null, address: null, lat: null, lon: null, url: u };
-                }
-                if (!rec) continue;
+                // id
+                const id = (html.match(/data-history-node-id=["'](\d+)["']/i) || html.match(/\/node\/(\d+)/i) || [])[1] || null;
 
-                items.push({ ...rec, ensena:"Charter", province:"barcelona" });
+                // JSON-LD
+                const jsonlds = await detail.$$eval('script[type="application/ld+json"]', ns => ns.map(n=>n.textContent));
+                let addr = null, lat=null, lon=null;
+                for (const txt of jsonlds){
+                  try{
+                    const val = JSON.parse(txt);
+                    const arr = Array.isArray(val) ? val : [val];
+                    for (const o of arr){
+                      const a = o?.address;
+                      if (a && !addr) addr = [a.streetAddress,a.postalCode,a.addressLocality,a.addressRegion].filter(Boolean).join(', ');
+                      const g = o?.geo || o?.GeoCoordinates || o?.location?.geo;
+                      if (g && g.latitude!=null && g.longitude!=null){ lat=+g.latitude; lon=+g.longitude; }
+                    }
+                  }catch{}
+                }
+
+                // fallback POINT (lon lat)
+                if (lat==null || lon==null){
+                  const m = html.match(/POINT\s*\(([-\d.]+)\s+([-\d.]+)\)/i);
+                  if (m){ lon=+m[1]; lat=+m[2]; }
+                }
+
+                out.push({ id, name: s.name, address: addr, lat, lon, url: s.url, ensena: "Charter", province: "barcelona" });
               }catch{}
             }
 
-            // dedupe
-            const seen = new Set();
-            const out = items.filter(x=>{
-              const k = x.id ? `id:${x.id}` : `na:${x.name}|${x.address}|${x.url}`;
-              if (seen.has(k)) return false; seen.add(k); return true;
-            });
-
-            await fs.mkdir("docs", { recursive:true });
+            await fs.mkdir("docs", {recursive:true});
             await fs.writeFile("docs/charter.json", JSON.stringify({
-              source:"listado→ficha→get-map",
+              source:"headless-dom",
               city:"barcelona",
               last_updated:new Date().toISOString(),
               count: out.length,
               items: out
             }, null, 2));
+
+            await fs.writeFile("docs/charter.geojson", JSON.stringify({
+              type:"FeatureCollection",
+              features: out.map(s=>({ type:"Feature", geometry:{type:"Point", coordinates:[s.lon,s.lat]}, properties:{ id:s.id,name:s.name,address:s.address,province:s.province,url:s.url,ensena:s.ensena } }))
+            }, null, 2));
+
             console.error(`[END] charter=${out.length}`);
+            await browser.close();
             console.log("OK");
           })().catch(e=>{ console.error(e); process.exit(1); });
           JS
@@ -141,6 +117,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/charter.json || true
-          git commit -m "mvp: barcelona listado→ficha→get-map [skip ci]" || true
+          git add docs/charter.json docs/charter.geojson || true
+          git commit -m "mvp: barcelona headless [skip ci]" || true
           git push || true 
