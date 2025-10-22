@@ -14,7 +14,7 @@ jobs:
       - name: Install Puppeteer
         run: npm i puppeteer@24.15.0
 
-      - name: Scrape Charter (Barcelona, headless)
+      - name: Capture AJAX + build JSON (Barcelona)
         run: |
           node - <<'JS'
           const fs = require("fs/promises");
@@ -23,126 +23,122 @@ jobs:
           const ORIGIN = "https://www.consum.es";
           const START  = `${ORIGIN}/supermercados/barcelona/`;
 
-          const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
-          const norm = s => (s||"").normalize("NFD").replace(/\p{Diacritic}/gu,"").toLowerCase();
+          const sleep = ms => new Promise(r=>setTimeout(r,ms));
 
-          async function clickCookieIfAny(page){
-            await page.evaluate(() => {
-              const btn = document.querySelector('#onetrust-accept-btn-handler');
-              if (btn) btn.click();
-            });
-            await sleep(600);
-            await page.evaluate(() => {
-              const texts = ["aceptar","accept","agree","consent"];
-              const els = Array.from(document.querySelectorAll('button,a,[role="button"]'));
-              const hit = els.find(el => texts.includes((el.textContent||"").trim().toLowerCase()));
-              if (hit) hit.click();
-            });
-            await sleep(600);
-          }
-
-          async function applyCharterFilter(page){
-            // Intenta pulsar el filtro "Charter". Si no existe, seguimos sin él.
-            await page.evaluate(() => {
-              const byLabel = Array.from(document.querySelectorAll('label'))
-                .find(l => (l.textContent||"").trim().toLowerCase() === 'charter');
-              if (byLabel) {
-                const inp = byLabel.querySelector('input'); if (inp) inp.click(); else byLabel.click();
-                return;
-              }
-              const inp = document.querySelector('input[id*="charter" i],input[value*="charter" i],input[name*="charter" i]');
-              if (inp) inp.click();
-            });
-            await sleep(1200);
-          }
-
-          async function autoScroll(page, max=40, wait=1200){
-            let last = 0;
-            for (let i=0;i<max;i++){
-              await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-              await sleep(wait);
-              const cnt = await page.$$eval('article.node--type-supermarket-map', els => els.length).catch(()=>0);
-              if (cnt <= last) break;
-              last = cnt;
-            }
-            await page.evaluate(() => window.scrollTo(0,0));
-            return last;
-          }
+          const isCharter = (p={})=>{
+            const icon = String(p.icon||"").toLowerCase();
+            const html = String(p.description||"").toLowerCase();
+            return icon.includes("icon_map_charter") || html.includes(" charter");
+          };
+          const collectFromSettings = (settings)=>{
+            const maps = settings?.geofield_google_map || {};
+            return Object.values(maps).flatMap(m=>m?.data?.features||[]);
+          };
 
           (async ()=>{
-            const browser = await puppeteer.launch({ headless: true, args:["--no-sandbox","--disable-setuid-sandbox"] });
+            const browser = await puppeteer.launch({ headless:true, args:["--no-sandbox","--disable-setuid-sandbox"] });
             const page = await browser.newPage();
             await page.setUserAgent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125 Safari/537.36");
             await page.setExtraHTTPHeaders({ "Accept-Language":"es-ES,es;q=0.9" });
 
-            await page.goto(START, { waitUntil:"domcontentloaded", timeout:60000 });
-            await clickCookieIfAny(page);
-            await applyCharterFilter(page); // si falla, no se rompe
-            const n = await autoScroll(page);
-            console.error(`[SCROLL] tarjetas=${n}`);
-
-            const cards = await page.$$eval('article.node--type-supermarket-map', els =>
-              els.map(el => {
-                const a = el.querySelector('.supermarket-label a');
-                return {
-                  html: (el.innerHTML||"").toLowerCase(),
-                  url: a ? a.href : null,
-                  name: a ? a.textContent.trim() : null
-                };
-              })
-            ).catch(()=>[]);
-
-            const charterCards = cards
-              .filter(c => c.url && (c.html.includes('col-distancia charter') || c.html.includes('icon_map_charter')))
-              .filter((v,i,a)=>a.findIndex(x=>x.url===v.url)===i);
-
-            console.error(`[PICK] charter_cards=${charterCards.length}`);
-
-            const detail = await browser.newPage();
-            const out = [];
-            for (const s of charterCards){
+            // Captura central de /views/ajax
+            const allFeats = [];
+            const seenAjax = new Set();
+            page.on("response", async (res)=>{
               try{
-                await detail.goto(s.url, { waitUntil:"domcontentloaded", timeout:60000 });
-                // JSON-LD
-                const ldTexts = await detail.$$eval('script[type="application/ld+json"]', ns => ns.map(n=>n.textContent)).catch(()=>[]);
-                let addr=null, lat=null, lon=null;
-                for (const txt of ldTexts){
-                  try{
-                    const val = JSON.parse(txt); const arr = Array.isArray(val)?val:[val];
-                    for (const o of arr){
-                      const a=o?.address; if (a && !addr) addr=[a.streetAddress,a.postalCode,a.addressLocality,a.addressRegion].filter(Boolean).join(', ');
-                      const g=o?.geo||o?.GeoCoordinates||o?.location?.geo;
-                      if (g && g.latitude!=null && g.longitude!=null){ lat=+g.latitude; lon=+g.longitude; }
-                    }
-                  }catch{}
-                }
-                if (lat==null || lon==null){
-                  const html = await detail.content();
-                  const m = html.match(/POINT\s*\(([-\d.]+)\s+([-\d.]+)\)/i);
-                  if (m){ lon=+m[1]; lat=+m[2]; }
-                }
-                const nid = await detail.evaluate(() => {
-                  const link = document.querySelector('link[rel="shortlink"]');
-                  const m = link && link.href.match(/\/node\/(\d+)/);
-                  return m ? m[1] : null;
-                }).catch(()=>null);
+                const url = res.url();
+                if (!url.includes("/views/ajax")) return;
+                if (seenAjax.has(url + "|" + res.request().method())) return;
+                seenAjax.add(url + "|" + res.request().method());
 
-                out.push({ id:nid, name:s.name, address:addr, lat, lon, url:s.url, ensena:"Charter", province:"barcelona" });
+                const ct = res.headers()["content-type"]||"";
+                if (!ct.includes("json")) return;
+                const payload = await res.json().catch(()=>null);
+                if (!Array.isArray(payload)) return;
+
+                const cmd = payload.find(x=>x?.command==="settings");
+                const settings = cmd?.settings;
+                if (!settings) return;
+
+                const feats = collectFromSettings(settings);
+                allFeats.push(...feats);
+                const c = feats.filter(f=>isCharter(f.properties)).length;
+                console.error(`[AJAX] +${feats.length} feats, charter=${c}`);
               }catch{}
+            });
+
+            await page.goto(START, { waitUntil:"domcontentloaded", timeout:60000 });
+
+            // cookies
+            await page.evaluate(() => {
+              const b=document.querySelector('#onetrust-accept-btn-handler'); if(b) b.click();
+            }).catch(()=>{});
+            await sleep(800);
+
+            // intenta activar filtro "Charter" si existe
+            await page.evaluate(()=>{
+              const byLabel=[...document.querySelectorAll('label')]
+                .find(l=>(l.textContent||"").trim().toLowerCase()==='charter');
+              if(byLabel){ (byLabel.querySelector('input')||byLabel).click(); return; }
+              const inp=document.querySelector('input[id*="charter" i],input[value*="charter" i],input[name*="charter" i]');
+              if(inp) inp.click();
+            }).catch(()=>{});
+            await sleep(1200);
+
+            // toma features iniciales desde drupalSettings embebido
+            const initSettings = await page.evaluate(()=>{
+              try{
+                const s=document.querySelector('script[data-drupal-selector="drupal-settings-json"]');
+                if(s) return JSON.parse(s.textContent);
+                return window.drupalSettings||null;
+              }catch{ return null; }
+            });
+            if (initSettings){
+              const f0 = collectFromSettings(initSettings);
+              allFeats.push(...f0);
+              console.error(`[INIT] feats=${f0.length} charter=${f0.filter(f=>isCharter(f.properties)).length}`);
+            } else {
+              console.error(`[INIT] sin drupalSettings`);
+            }
+
+            // auto-scroll: dispara peticiones /views/ajax y deja que el listener las acumule
+            let lastCnt = 0, stagnant = 0;
+            for (let i=0;i<40;i++){
+              await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(()=>{});
+              await sleep(1400);
+              const curr = allFeats.length;
+              if (curr<=lastCnt) stagnant++; else stagnant=0;
+              lastCnt = curr;
+              if (stagnant>=3) break; // no entran nuevos
             }
 
             await browser.close();
 
-            // dedupe
+            // dedupe por id o name+addr
+            const items = [];
             const seen = new Set();
-            const items = out.filter(x=>{
-              const k = x.id ? `id:${x.id}` : `na:${norm(x.name)}|${norm(x.address)}|${x.url}`;
-              if (seen.has(k)) return false; seen.add(k); return true;
-            });
+            for (const f of allFeats){
+              if (!isCharter(f?.properties)) continue;
+              const p=f.properties||{}, d=p.data||{}, c=f.geometry?.coordinates||[null,null];
+              const href = String(p.description||"").match(/href="([^"]+)"/)?.[1] || null;
+              const rec = {
+                id: p.entity_id ?? null,
+                name: p.tooltip || null,
+                address: d.field_domicilio || null,
+                province: "barcelona",
+                lat: c[1] ?? null,
+                lon: c[0] ?? null,
+                url: href ? new URL(href, ORIGIN).toString() : null,
+                ensena: "Charter"
+              };
+              const k = rec.id ? `id:${rec.id}` : `na:${rec.name}|${rec.address}`;
+              if (seen.has(k)) continue; seen.add(k);
+              items.push(rec);
+            }
 
             await fs.mkdir("docs", { recursive:true });
             await fs.writeFile("docs/charter.json", JSON.stringify({
-              source:"puppeteer (filtro UI opcional + scroll + ficha)",
+              source:"views/ajax capture",
               city:"barcelona",
               last_updated:new Date().toISOString(),
               count: items.length,
@@ -150,10 +146,14 @@ jobs:
             }, null, 2));
             await fs.writeFile("docs/charter.geojson", JSON.stringify({
               type:"FeatureCollection",
-              features: items.map(s=>({ type:"Feature", geometry:{type:"Point", coordinates:[s.lon,s.lat]}, properties:{ id:s.id,name:s.name,address:s.address,province:s.province,url:s.url,ensena:s.ensena } }))
+              features: items.map(s=>({
+                type:"Feature",
+                geometry:{ type:"Point", coordinates:[s.lon,s.lat] },
+                properties:{ id:s.id,name:s.name,address:s.address,province:s.province,url:s.url,ensena:s.ensena }
+              }))
             }, null, 2));
 
-            console.error(`[END] total_charter=${items.length}`);
+            console.error(`[END] ajax_calls=${seenAjax.size} features_total=${allFeats.length} charter=${items.length}`);
             console.log("OK");
           })().catch(e=>{ console.error(e); process.exit(1); });
           JS
