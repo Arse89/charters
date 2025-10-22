@@ -3,9 +3,9 @@ on:
   workflow_dispatch:
     inputs:
       city:
-        description: "Filtro ciudad/provincia (p.ej. barcelona). Usa 'all' para todo."
+        description: "Filtro texto (p.ej. barcelona). Usa 'all' para todo."
         required: false
-        default: "barcelona"
+        default: "all"
 permissions:
   contents: write
 
@@ -18,233 +18,161 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Build JSON desde sitemap (fichas reales + JSON-LD + fallback get-map)
+      - name: Build JSON desde sitemap → fichas → drupalSettings (sin AJAX)
         env:
           CITY: ${{ github.event.inputs.city }}
         run: |
           node - <<'JS'
           const fs = require("fs/promises");
           const ORIGIN = "https://www.consum.es";
-          const CITY_FILTER = (process.env.CITY || "barcelona").toLowerCase();
-
-          const H = {
-            "User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125 Safari/537.36",
-            "Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language":"es-ES,es;q=0.9",
+          const CITY = (process.env.CITY || "all").toLowerCase();
+          const UA = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "es-ES,es;q=0.9",
             "Referer": ORIGIN + "/"
           };
 
-          const PROVINCES = new Set([
-            "valencia","alicante","castellon","barcelona","tarragona","lleida","girona",
-            "murcia","albacete","almeria","cuenca","toledo","ciudad-real","ciudad_real"
-          ]);
-
           const sleep = ms => new Promise(r=>setTimeout(r,ms));
-          const norm = s => s.normalize("NFD").replace(/\p{Diacritic}/gu,"").toLowerCase();
+          const norm = s => (s||"").normalize("NFD").replace(/\p{Diacritic}/gu,"").toLowerCase();
 
-          async function get(u){ const r=await fetch(u,{headers:H}); const t=await r.text(); if(!r.ok) throw new Error(`HTTP ${r.status} ${u}\n${t.slice(0,300)}`); return t; }
-          async function getJSON(u){ const r=await fetch(u,{headers:{...H,Accept:"application/json"}}); const t=await r.text(); try{ return JSON.parse(t);}catch{ return null;} }
+          async function get(u){
+            const r = await fetch(u, { headers: UA });
+            const t = await r.text();
+            if (!r.ok) throw new Error(`HTTP ${r.status} ${u}\n${t.slice(0,300)}`);
+            return t;
+          }
+          function parseSitemap(xml){
+            return [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map(m=>m[1].trim());
+          }
 
-          function parseSitemap(xml){ return [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map(m=>m[1].trim()); }
-
-          async function collectStoreUrls(){
+          // 1) Saca TODAS las URLs bajo /supermercados/ (fichas y listados)
+          async function collectSuperUrls(){
             const root = await get(`${ORIGIN}/sitemap.xml`);
             let locs = parseSitemap(root);
-
-            // seguir a sitemaps secundarios
             const children = locs.filter(u=>/sitemap.*\.xml/i.test(u));
             if (children.length){
               const all=[]; for (const sm of children){ try{ all.push(...parseSitemap(await get(sm))); }catch{} }
               locs = all;
             }
-
-            // solo rutas bajo /supermercados/ y que aparenten ser ficha (segmento != provincia)
-            const urls = locs
-              .filter(u => u.includes("/supermercados/"))
-              .filter(u => {
-                try{
-                  const p = new URL(u).pathname.replace(/^\/|\/$/g,"").split("/");
-                  const i = p.indexOf("supermercados");
-                  if (i === -1) return false;
-                  const seg = p[i+1] || "";          // segmento tras /supermercados/
-                  if (!seg) return false;
-                  return !PROVINCES.has(seg);        // descarta listados por provincia
-                }catch{ return false; }
-              });
-
-            return Array.from(new Set(urls));
+            return Array.from(new Set(locs.filter(u=>u.includes("/supermercados/"))));
           }
 
-          function extractJSONLD(html){
-            const blocks = [...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)].map(m=>m[1]);
-            const out=[];
-            for (const b of blocks){
-              try { const v=JSON.parse(b); Array.isArray(v)?out.push(...v):out.push(v); }
-              catch {
-                // intenta trocear si viniera pegado
-                const parts=b.split(/\n(?=\s*{\s*"@context")/);
-                for(const p of parts){ try{ out.push(JSON.parse(p)); }catch{} }
-              }
-            }
-            return out;
-          }
-          const pick = (objs, key) => { for (const o of objs){ if (o && o[key]!=null) return o[key]; } return null; };
-
-          function geoFromLD(objs){
-            for (const o of objs){
-              const g = o?.geo || o?.GeoCoordinates || o?.location?.geo;
-              if (g && g.latitude!=null && g.longitude!=null) return {lat:+g.latitude, lon:+g.longitude};
-            }
-            return null;
-          }
-          function localityFromLD(objs){
-            for (const o of objs){
-              const a=o?.address;
-              if (a && (a.addressLocality || a.addressRegion || a.addressCountry)){
-                return [a.addressLocality,a.addressRegion].filter(Boolean).join(", ");
-              }
-            }
-            return null;
-          }
-          function addressLineFromLD(objs){
-            for (const o of objs){
-              const a=o?.address;
-              if (a){
-                const s=[a.streetAddress,a.postalCode,a.addressLocality,a.addressRegion].filter(Boolean).join(", ");
-                if (s) return s;
-              }
-            }
+          // 2) Extrae drupalSettings de una ficha
+          function extractDrupalSettings(html){
+            // preferido: <script data-drupal-selector="drupal-settings-json"> ... </script>
+            const m1 = html.match(/<script[^>]+data-drupal-selector=["']drupal-settings-json["'][^>]*>([\s\S]*?)<\/script>/i);
+            if (m1) { try { return JSON.parse(m1[1]); } catch {} }
+            // fallback: window.drupalSettings = {...};
+            const m2 = html.match(/drupalSettings\s*=\s*({[\s\S]*?})\s*;?\s*<\/script>/i);
+            if (m2) { try { return JSON.parse(m2[1]); } catch {} }
             return null;
           }
 
-          // detectar Charter en ficha: texto y/o icono en HTML
-          function isCharterInHTML(html){
-            const h = html.toLowerCase();
-            return h.includes("icon_map_charter") || h.includes(" charter");
+          // 3) De drupalSettings → features del mapa (si hay)
+          function featuresFromSettings(ds){
+            const maps = ds?.geofield_google_map || ds?.settings?.geofield_google_map || {};
+            return Object.values(maps).flatMap(m => m?.data?.features || []);
           }
 
-          // extraer node id por varios patrones
-          function extractNodeId(html){
-            const patterns = [
-              /<link[^>]+rel=["']shortlink["'][^>]+href=["'][^"']*\/node\/(\d+)["']/i,
-              /geofield-map-node-centro-(\d+)-field-coordenadas/i,
-              /data-history-node-id=["'](\d+)["']/i,
-              /data-nid=["'](\d+)["']/i,
-              /"entity_id"\s*:\s*"(\d+)"/i,
-              /\/node\/(\d+)[^0-9]/i
-            ];
-            for (const re of patterns){ const m=html.match(re); if (m) return m[1]; }
-            return null;
+          // 4) Detecta Charter por icono o clase
+          function isCharterProp(p={}){
+            const icon = String(p.icon||"").toLowerCase();
+            const html = String(p.description||"").toLowerCase();
+            return icon.includes("icon_map_charter") || html.includes(" charter");
           }
 
-          function charterFromMapJSON(json){
-            const maps = json?.[0]?.settings?.geofield_google_map || {};
-            const feats = Object.values(maps).flatMap(b=>b?.data?.features||[]);
-            const f = feats.find(x=>{
-              const icon=String(x?.properties?.icon||"").toLowerCase();
-              const desc=String(x?.properties?.description||"").toLowerCase();
-              return icon.includes("icon_map_charter") || desc.includes(" charter");
-            });
-            if (!f) return null;
-            const p=f.properties||{}, d=p.data||{}, c=f.geometry?.coordinates||[null,null];
-            const href=String(p.description||"").match(/href="([^"]+)"/)?.[1]||null;
-            return {
-              id: p.entity_id ?? null,
-              name: p.tooltip ?? null,
-              address: d.field_domicilio ?? null,
-              lat: c[1] ?? null,
-              lon: c[0] ?? null,
-              url: href ? new URL(href, ORIGIN).toString() : null
-            };
+          // 5) Intenta atar el feature a la propia ficha por URL
+          function matchFeatureToPage(features, pagePath){
+            const rel = pagePath.endsWith("/") ? pagePath : pagePath + "/";
+            // prioridad: el feature cuya descripción tiene un <a href="...esta ficha...">
+            const byHref = features.find(f => String(f?.properties?.description||"").includes(`href="${rel}"`));
+            if (byHref) return byHref;
+            // si solo hay uno, usa ese
+            if (features.length === 1) return features[0];
+            // si hay varios, usa cualquiera que sea Charter
+            const anyCharter = features.find(f => isCharterProp(f?.properties));
+            return anyCharter || features[0];
           }
 
           (async ()=>{
             await fs.mkdir("docs", {recursive:true});
-            await fs.mkdir("docs/debug", {recursive:true});
+            const urls = await collectSuperUrls();
 
-            const urls = await collectStoreUrls();
-            console.error(`[SITEMAP] fichas candidatas=${urls.length}`);
+            // Filtra a fichas reales aproximando: 2º segmento tras /supermercados/ que NO parezca listado.
+            // Aun así, si cuela algún listado, se descartará porque no tendrá drupalSettings con features de tienda.
+            const candidates = urls.filter(u=>{
+              try{
+                const parts = new URL(u).pathname.replace(/^\/|\/$/g,"").split("/");
+                const i = parts.indexOf("supermercados");
+                const seg = parts[i+1] || "";
+                if (!seg) return false;
+                // heurística: listado por provincia suele ser un solo segmento "barcelona", "valencia", etc.
+                // fichas llevan nombres largos con guiones.
+                return seg.includes("-") || seg.length > 12;
+              }catch{ return false; }
+            });
 
-            let kept=0, withLD=0, withGeo=0, viaMap=0, charter=0;
+            // Aplica filtro CITY por URL o lo diferimos a contenido
+            const pre = CITY==="all" ? candidates : candidates.filter(u => norm(u).includes(norm(CITY)));
+            console.error(`[SITEMAP] fichas=${candidates.length} prefiltradas=${pre.length}`);
+
             const items=[];
-
-            for (let i=0;i<urls.length;i++){
-              const u = urls[i];
+            let fetched=0;
+            for (const u of pre){
               try{
                 const html = await get(u);
+                const ds = extractDrupalSettings(html);
+                if (!ds) continue;
+                const feats = featuresFromSettings(ds);
+                if (!feats.length) continue;
 
-                // JSON-LD
-                const ld = extractJSONLD(html);
-                const types = ld.map(o=>o?.["@type"]).filter(Boolean).flat();
-                const isStore = types.some(t=>String(t).toLowerCase().includes("store") || String(t).toLowerCase().includes("localbusiness"));
-                if (!isStore) continue; // descarta listados residuales
+                const pagePath = new URL(u).pathname;
+                const feat = matchFeatureToPage(feats, pagePath);
+                if (!feat) continue;
 
-                kept++;
+                const p = feat.properties || {};
+                const d = p.data || {};
+                const c = feat.geometry?.coordinates || [null,null];
 
-                const name = pick(ld,"name");
-                const addrLine = addressLineFromLD(ld);
-                const geo = geoFromLD(ld);
-                if (ld.length) withLD++;
-
-                // filtro por ciudad/provincia usando LD o contenido
-                const loc = localityFromLD(ld) || "";
-                const hayCiudad = CITY_FILTER==="all" ? true :
-                                  norm(u).includes(norm(CITY_FILTER)) ||
-                                  norm(loc).includes(norm(CITY_FILTER)) ||
-                                  norm(html).includes(norm(CITY_FILTER));
-                if (!hayCiudad) continue;
-
-                // Detecta Charter
-                let isCharter = isCharterInHTML(html);
-
-                // Si no es concluyente, intenta get-map/<id>
-                let lat = geo?.lat ?? null, lon = geo?.lon ?? null;
-                let id = null;
-
-                if (!isCharter || lat==null || lon==null){
-                  const nid = extractNodeId(html);
-                  if (nid){
-                    id = nid;
-                    const mapJson = await getJSON(`${ORIGIN}/get-map/${nid}/`);
-                    const fromMap = charterFromMapJSON(mapJson);
-                    if (fromMap){
-                      isCharter = true;
-                      lat = fromMap.lat ?? lat;
-                      lon = fromMap.lon ?? lon;
-                      // completa nombre/dirección si faltan
-                      const n2 = fromMap.name || name || null;
-                      const a2 = fromMap.address || addrLine || null;
-                      items.push({ id: fromMap.id || id, name: n2, address: a2, lat, lon, url: fromMap.url || u, ensena:"Charter" });
-                      viaMap++; charter++; continue;
-                    }
-                  }
+                // ciudad/provincia por contenido si CITY != all
+                if (CITY!=="all"){
+                  const blob = `${u}\n${p.tooltip||""}\n${d.field_domicilio||""}\n${p.description||""}`;
+                  if (!norm(blob).includes(norm(CITY))) continue;
                 }
 
-                if (isCharter){
-                  if (lat!=null && lon!=null) { withGeo++; }
-                  items.push({ id, name: name||null, address: addrLine||null, lat, lon, url: u, ensena:"Charter" });
-                  charter++;
-                }
+                // Solo Charter
+                if (!isCharterProp(p)) continue;
 
-                if (i<5) await fs.writeFile(`docs/debug/sample${i}.html`, html);
-                await sleep(120); // cortesía
+                const href = String(p.description||"").match(/href="([^"]+)"/)?.[1] || u;
+                items.push({
+                  id: p.entity_id ?? null,
+                  name: p.tooltip || null,
+                  address: d.field_domicilio || null,
+                  lat: c[1] ?? null,
+                  lon: c[0] ?? null,
+                  url: new URL(href, ORIGIN).toString(),
+                  ensena: "Charter",
+                  source: u
+                });
+                fetched++;
+                if (fetched % 25 === 0) await sleep(150);
               }catch(e){
-                console.error(`[ERR] ${u} :: ${e.message}`);
+                // silencioso para robustez
               }
             }
 
             // dedupe
-            const seen=new Set();
-            const out=items.filter(x=>{
-              const k = x.id ? `id:${x.id}` : `na:${(x.name||"")}|${(x.address||"")}`;
+            const seen = new Set();
+            const out = items.filter(x=>{
+              const k = x.id ? `id:${x.id}` : `na:${x.name}|${x.address}`;
               if (seen.has(k)) return false; seen.add(k); return true;
             });
 
             await fs.writeFile("docs/charter.json", JSON.stringify({
-              source:"consum.es (sitemap→ficha→JSON-LD + get-map fallback)",
-              city_filter: CITY_FILTER,
-              totals:{ candidates:urls.length, kept, withLD, withGeo, viaMap, charter, out: out.length },
-              last_updated:new Date().toISOString(),
+              source: "consum.es (sitemap→ficha→drupalSettings)",
+              city_filter: CITY,
+              last_updated: new Date().toISOString(),
               count: out.length,
               items: out
             }, null, 2));
@@ -254,11 +182,11 @@ jobs:
               features: out.map(s=>({
                 type:"Feature",
                 geometry:{ type:"Point", coordinates:[s.lon,s.lat] },
-                properties:{ id:s.id, name:s.name, address:s.address, url:s.url, ensena:s.ensena }
+                properties:{ id:s.id,name:s.name,address:s.address,url:s.url,ensena:s.ensena }
               }))
             }, null, 2));
 
-            console.error(`[END] out=${out.length} kept=${kept} withLD=${withLD} viaMap=${viaMap} charter=${charter}`);
+            console.error(`[END] total=${out.length}`);
             console.log("OK");
           })().catch(e=>{ console.error(e); process.exit(1); });
           JS
@@ -269,8 +197,8 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add docs
-            git commit -m "mvp sitemap fichas: ${CITY:-barcelona} [skip ci]" || true
+            git commit -m "mvp drupalSettings: ${CITY:-all} [skip ci]" || true
             git push
           else
             echo "Sin cambios"
-          fi
+          fi 
