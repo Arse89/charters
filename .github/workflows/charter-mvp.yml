@@ -1,88 +1,86 @@
-- name: Build JSON (MVP debug)
+- name: Build JSON (unir bloques + ajax_page_state + logs)
   env: { CITY: ${{ github.event.inputs.city }} }
   run: |
     node - <<'JS'
     const fs = require("fs/promises");
-    const base = "https://www.consum.es";
     const CITY = (process.env.CITY || "barcelona").toLowerCase();
+    const ORIGIN = "https://www.consum.es";
+    const FEED  = `${ORIGIN}/get-map-list/block_supermercados_en_${CITY}/`;
 
-    const url0 = `${base}/get-map-list/block_supermercados_en_${CITY}/`;
-
-    async function getJson(u){
-      const r = await fetch(u, { headers:{Accept:"application/json"} });
+    async function getJson(u, opt={}) {
+      const r = await fetch(u, { headers:{Accept:"application/json"}, ...opt });
       if(!r.ok) throw new Error(`HTTP ${r.status} ${u}`);
       try { return await r.json(); } catch { return JSON.parse(await r.text()); }
     }
 
-    function collectFeaturesFromSettings(settings){
-      const maps = settings?.geofield_google_map || {};
-      const keys = Object.keys(maps);
-      let features = [];
-      for(const k of keys){
-        const f = maps[k]?.data?.features;
-        if(Array.isArray(f)) features = features.concat(f);
-      }
-      return { keys, features };
-    }
-
-    const isCharter = (prop={})=>{
-      const icon = String(prop.icon||"").toLowerCase();
-      const html = String(prop.description||"").toLowerCase();
+    const isCharter = (p={})=>{
+      const icon = String(p.icon||"").toLowerCase();
+      const html = String(p.description||"").toLowerCase();
       return icon.includes("icon_map_charter") || html.includes("col-distancia charter");
     };
 
-    (async()=>{
-      await fs.mkdir("docs/debug", { recursive:true });
+    function collect(settings){
+      const maps = settings?.geofield_google_map || {};
+      const blocks = Object.values(maps);
+      const feats = blocks.flatMap(b => b?.data?.features ?? []);
+      return { blocks: blocks.length, feats };
+    }
 
-      // 1) Descarga inicial
-      const data0 = await getJson(url0);
-      await fs.writeFile(`docs/debug/${CITY}-init.json`, JSON.stringify(data0, null, 2));
-      const settings0 = data0?.[0]?.settings || {};
-      const ajaxViews = settings0?.views?.ajaxViews || {};
-      const ajaxPath  = settings0?.views?.ajax_path || "/views/ajax/";
+    (async ()=>{
+      await fs.mkdir("docs/debug", {recursive:true});
 
-      const { keys: mapKeys0, features: feats0 } = collectFeaturesFromSettings(settings0);
-      const c0 = feats0.filter(f=>isCharter(f.properties)).length;
-      console.error(`[INIT] ajaxPath=${ajaxPath} mapBlocks=${mapKeys0.length} rawFeatures=${feats0.length} charter=${c0}`);
+      // 1) Init feed
+      const data0 = await getJson(FEED);
+      await fs.writeFile(`docs/debug/${CITY}-init.json`, JSON.stringify(data0,null,2));
 
-      // 2) Llamadas a views/ajax para cada display
-      const ajaxUrl = new URL(ajaxPath, base).toString();
-      let featsAll = feats0.slice();
+      const set0   = data0?.[0]?.settings || {};
+      const ajax   = set0?.views?.ajaxViews || {};
+      const path   = set0?.views?.ajax_path || "/views/ajax/";
+      const libs   = set0?.ajaxPageState?.libraries || "";
+      const theme  = set0?.ajaxPageState?.theme || "";
+      const ajaxURL = new URL(path, ORIGIN).toString();
 
-      for(const [domId, v] of Object.entries(ajaxViews)){
+      const c0 = collect(set0);
+      console.error(`[INIT] ajax_path=${path} blocks=${c0.blocks} raw=${c0.feats.length} charter=${c0.feats.filter(f=>isCharter(f.properties)).length}`);
+
+      // 2) views/ajax for all displays
+      let featsAll = c0.feats.slice();
+      for (const [domId, v] of Object.entries(ajax)) {
         const form = new URLSearchParams({
-          "view_name": v.view_name || "supermarkets",
-          "view_display_id": v.view_display_id || "",
-          "view_args": v.view_args || "",
-          "view_path": v.view_path || "",
-          "view_base_path": v.view_base_path || "supermercados",
-          "view_dom_id": v.view_dom_id || "",
-          "pager_element": String(v.pager_element ?? 0)
+          view_name: v.view_name || "supermarkets",
+          view_display_id: v.view_display_id || "",
+          view_args: v.view_args || "",
+          view_path: v.view_path || "",
+          view_base_path: v.view_base_path || "supermercados",
+          view_dom_id: v.view_dom_id || "",
+          pager_element: String(v.pager_element ?? 0),
+          "ajax_page_state[libraries]": libs,
+          "ajax_page_state[theme]": theme
         });
 
-        const r = await fetch(ajaxUrl, {
+        const r = await fetch(ajaxURL, {
           method: "POST",
-          headers: { "Content-Type":"application/x-www-form-urlencoded; charset=UTF-8" },
+          headers: {
+            "Content-Type":"application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With":"XMLHttpRequest",
+            "Referer": `${ORIGIN}/supermercados/${CITY}/`
+          },
           body: form.toString()
         });
-        if(!r.ok){ console.error(`[AJAX] ${domId} HTTP ${r.status}`); continue; }
 
         let resp; try { resp = await r.json(); } catch { resp = JSON.parse(await r.text()); }
-        await fs.writeFile(`docs/debug/${CITY}-ajax-${domId}.json`, JSON.stringify(resp, null, 2));
+        await fs.writeFile(`docs/debug/${CITY}-ajax-${domId}.json`, JSON.stringify(resp,null,2));
 
-        // En Drupal, el payload es un array de "commands". Busca el de "settings".
         const cmd = Array.isArray(resp) ? resp.find(x=>x?.command==="settings") : null;
-        const settingsX = cmd?.settings;
-        if(!settingsX){ console.error(`[AJAX] ${domId} sin settings`); continue; }
+        const setX = cmd?.settings;
+        if (!setX) { console.error(`[AJAX] ${v.view_display_id} sin settings`); continue; }
 
-        const { keys: mapKeysX, features: featsX } = collectFeaturesFromSettings(settingsX);
-        featsAll = featsAll.concat(featsX);
-
-        const cX = featsX.filter(f=>isCharter(f.properties)).length;
-        console.error(`[AJAX] ${v.view_display_id} mapBlocks=${mapKeysX.length} rawFeatures=${featsX.length} charter=${cX}`);
+        const cx = collect(setX);
+        featsAll = featsAll.concat(cx.feats);
+        console.error(`[AJAX] ${v.view_display_id} blocks=${cx.blocks} raw=${cx.feats.length} charter=${cx.feats.filter(f=>isCharter(f.properties)).length}`);
       }
 
-      // 3) Normaliza, filtra Charter y dedup
+      // 3) Normalize + filter + dedupe
       const items = featsAll
         .filter(f=>isCharter(f.properties))
         .map(f=>{
@@ -95,7 +93,7 @@
             province: CITY,
             lat: c[1] ?? null,
             lon: c[0] ?? null,
-            url: href ? new URL(href, base).toString() : null,
+            url: href ? new URL(href, ORIGIN).toString() : null,
             ensena: "Charter"
           };
         });
@@ -103,10 +101,10 @@
       const seen = new Set();
       const dedup = items.filter(x=>{
         const k = x.id ? `id:${x.id}` : `na:${x.name}|${x.address}`;
-        if(seen.has(k)) return false; seen.add(k); return true;
+        if (seen.has(k)) return false; seen.add(k); return true;
       });
 
-      // 4) Salidas
+      // 4) Outputs
       await fs.writeFile("docs/charter.json", JSON.stringify({
         source: "consum.es (get-map-list + views/ajax)",
         last_updated: new Date().toISOString(),
@@ -123,7 +121,7 @@
         }))
       }, null, 2));
 
-      console.error(`[END] totalFeatures=${featsAll.length} totalCharter=${dedup.length}`);
+      console.error(`[END] totalRaw=${featsAll.length} totalCharter=${dedup.length}`);
       console.log(`OK ${CITY}`);
     })().catch(e=>{ console.error(e); process.exit(1); });
     JS
