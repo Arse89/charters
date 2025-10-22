@@ -6,19 +6,24 @@ on:
         description: "Provincia slug (ej.: barcelona, valencia, alicante)"
         required: false
         default: "barcelona"
+
 permissions:
   contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
 
+      - name: Export CITY for later steps
+        run: echo "CITY=${{ github.event.inputs.city || 'barcelona' }}" >> $GITHUB_ENV
+
       - name: Build JSON (1 provincia, all map blocks)
-        env: { CITY: ${{ github.event.inputs.city }} }
         run: |
           node - <<'JS'
           const fs = require("fs/promises");
@@ -35,14 +40,13 @@ jobs:
             const url = `${BASE}${CITY}/`;
             const data = await fetchJson(url);
 
-            // Unir TODAS las claves del mapa, no solo la primera
+            // Unir TODOS los bloques del mapa
             const maps = data?.[0]?.settings?.geofield_google_map || {};
             let features = [];
-            for(const k of Object.keys(maps)){
+            for (const k of Object.keys(maps)) {
               const f = maps[k]?.data?.features;
-              if(Array.isArray(f)) features = features.concat(f);
+              if (Array.isArray(f)) features = features.concat(f);
             }
-            console.error(`debug: maps=${Object.keys(maps).length} features=${features.length}`);
 
             const items = features
               .filter(f => String(f?.properties?.icon||"").toLowerCase().includes("charter"))
@@ -61,27 +65,27 @@ jobs:
                 };
               });
 
-            // dedupe por id o por name|address
+            // Deduplicar
             const seen = new Set();
             const dedup = items.filter(x=>{
               const k = x.id ? `id:${x.id}` : `na:${x.name}|${x.address}`;
-              if(seen.has(k)) return false; seen.add(k); return true;
+              if (seen.has(k)) return false; seen.add(k); return true;
             });
 
-            await fs.mkdir("docs",{recursive:true});
+            await fs.mkdir("docs", { recursive: true });
             await fs.writeFile("docs/charter.json", JSON.stringify({
-              source:"consum.es locator",
-              last_updated:new Date().toISOString(),
-              count:dedup.length,
-              items:dedup
+              source: "consum.es locator",
+              last_updated: new Date().toISOString(),
+              count: dedup.length,
+              items: dedup
             }, null, 2));
 
             await fs.writeFile("docs/charter.geojson", JSON.stringify({
-              type:"FeatureCollection",
-              features:dedup.map(s=>({
-                type:"Feature",
-                geometry:{ type:"Point", coordinates:[s.lon,s.lat] },
-                properties:{ id:s.id,name:s.name,address:s.address,province:s.province,url:s.url,ensena:s.ensena }
+              type: "FeatureCollection",
+              features: dedup.map(s => ({
+                type: "Feature",
+                geometry: { type: "Point", coordinates: [s.lon, s.lat] },
+                properties: { id: s.id, name: s.name, address: s.address, province: s.province, url: s.url, ensena: s.ensena }
               }))
             }, null, 2));
 
@@ -95,7 +99,8 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add docs/charter.json docs/charter.geojson
-            git commit -m "mvp: ${GITHUB_EVENT_INPUTS_CITY:-barcelona} Charter [skip ci]"
+            git commit -m "mvp: ${CITY} Charter [skip ci]"
+            git pull --rebase
             git push
           else
             echo "Sin cambios"
