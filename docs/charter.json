@@ -1,7 +1,7 @@
 {
-  "source": "listado→ficha→get-map",
+  "source": "puppeteer (filtro UI opcional + scroll + ficha)",
   "city": "barcelona",
-  "last_updated": "2025-10-22T09:29:15.530Z",
+  "last_updated": "2025-10-22T09:46:45.775Z",
   "count": 0,
   "items": []
 }
