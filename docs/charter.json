@@ -1,20 +1,14 @@
 {
-  "source": "get-map-list (barcelona, page=0)",
-  "count": 2,
+  "source": "get-map-list (?page=N)",
+  "city": "barcelona",
+  "last_updated": "2025-10-22T09:25:33.992Z",
+  "count": 1,
   "items": [
     {
       "id": "782184",
       "name": "SANT VICENÇ DELS HORTS M.J VERDAGUER",
       "address": "c/ Mossèn Jacint Verdaguer, 221",
-      "lat": 41.399387,
-      "lon": 2.006364,
-      "url": "https://www.consum.es/supermercados/sant-vicenc-dels-horts-m-j-verdaguer/",
-      "ensena": "Charter"
-    },
-    {
-      "id": "782184",
-      "name": "SANT VICENÇ DELS HORTS M.J VERDAGUER",
-      "address": "c/ Mossèn Jacint Verdaguer, 221",
+      "province": "barcelona",
       "lat": 41.399387,
       "lon": 2.006364,
       "url": "https://www.consum.es/supermercados/sant-vicenc-dels-horts-m-j-verdaguer/",
