@@ -1,0 +1,23 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          2.006364,
+          41.399387
+        ]
+      },
+      "properties": {
+        "id": "782184",
+        "name": "SANT VICENÇ DELS HORTS M.J VERDAGUER",
+        "address": "c/ Mossèn Jacint Verdaguer, 221",
+        "province": "barcelona",
+        "url": "https://www.consum.es/supermercados/sant-vicenc-dels-horts-m-j-verdaguer/",
+        "ensena": "Charter"
+      }
+    }
+  ]
+}
