@@ -1,0 +1,94 @@
+name: charter-mvp
+on:
+  workflow_dispatch:
+    inputs:
+      city:
+        description: "Provincia slug (ej.: barcelona, valencia, alicante)"
+        required: false
+        default: "barcelona"
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build JSON (1 provincia)
+        env:
+          CITY: ${{ github.event.inputs.city }}
+        run: |
+          node - <<'JS'
+          const fs = require("fs/promises");
+
+          const CITY = process.env.CITY || "barcelona";
+          const BASE = "https://www.consum.es/get-map-list/block_supermercados_en_";
+
+          async function main() {
+            const url = `${BASE}${CITY}/`;
+            const res = await fetch(url, { headers: { Accept: "application/json" } });
+            if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`);
+            let data;
+            try { data = await res.json(); }
+            catch { data = JSON.parse(await res.text()); }
+
+            const mapRec = data?.[0]?.settings?.geofield_google_map;
+            const firstKey = mapRec ? Object.keys(mapRec)[0] : null;
+            const features = firstKey ? (mapRec[firstKey]?.data?.features || []) : [];
+
+            const items = features
+              .filter(f => String(f?.properties?.icon || "").includes("charter"))
+              .map(f => {
+                const p = f.properties || {};
+                const d = p.data || {};
+                const c = (f.geometry && f.geometry.coordinates) || [null, null];
+                const href = String(p.description || "").match(/href="([^"]+)"/)?.[1] || null;
+                return {
+                  id: p.entity_id ?? null,
+                  name: p.tooltip ?? null,
+                  address: d.field_domicilio ?? null,
+                  province: CITY,
+                  lat: c[1] ?? null,
+                  lon: c[0] ?? null,
+                  url: href ? new URL(href, "https://www.consum.es").toString() : null,
+                  ensena: "Charter"
+                };
+              });
+
+            await fs.mkdir("docs", { recursive: true });
+            await fs.writeFile("docs/charter.json", JSON.stringify({
+              source: "consum.es locator",
+              last_updated: new Date().toISOString(),
+              count: items.length,
+              items
+            }, null, 2));
+
+            await fs.writeFile("docs/charter.geojson", JSON.stringify({
+              type: "FeatureCollection",
+              features: items.map(s => ({
+                type: "Feature",
+                geometry: { type: "Point", coordinates: [s.lon, s.lat] },
+                properties: { id: s.id, name: s.name, address: s.address, province: s.province, url: s.url, ensena: s.ensena }
+              }))
+            }, null, 2));
+
+            console.log(`OK ${CITY}: ${items.length} Charter`);
+          }
+          main().catch(e => { console.error(e); process.exit(1); });
+          JS
+
+      - name: Commit if changed
+        run: |
+          if [[ -n "$(git status --porcelain docs)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add docs/charter.json docs/charter.geojson
+            git commit -m "mvp: ${GITHUB_EVENT_INPUTS_CITY:-barcelona} Charter [skip ci]"
+            git push
+          else
+            echo "Sin cambios"
+          fi
