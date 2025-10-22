@@ -10,12 +10,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
+        with: { node-version: "20" }
       - name: Install Puppeteer
-        run: npm i puppeteer@22
+        run: npm i puppeteer@24.15.0
 
-      - name: Scrape Charter (Barcelona, headless, sin XPath)
+      - name: Scrape Charter (Barcelona, headless)
         run: |
           node - <<'JS'
           const fs = require("fs/promises");
@@ -24,48 +23,45 @@ jobs:
           const ORIGIN = "https://www.consum.es";
           const START  = `${ORIGIN}/supermercados/barcelona/`;
 
+          const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
           const norm = s => (s||"").normalize("NFD").replace(/\p{Diacritic}/gu,"").toLowerCase();
 
           async function clickCookieIfAny(page){
-            // OneTrust típico
-            const ot = await page.$('#onetrust-accept-btn-handler');
-            if (ot) { await ot.click().catch(()=>{}); await page.waitForTimeout(600); return; }
-            // Botón con texto "Aceptar"/"Accept" sin XPath
+            await page.evaluate(() => {
+              const btn = document.querySelector('#onetrust-accept-btn-handler');
+              if (btn) btn.click();
+            });
+            await sleep(600);
             await page.evaluate(() => {
               const texts = ["aceptar","accept","agree","consent"];
-              const els = Array.from(document.querySelectorAll('button, a, [role="button"]'));
-              const hit = els.find(el => texts.some(t => (el.textContent||"").trim().toLowerCase() === t));
+              const els = Array.from(document.querySelectorAll('button,a,[role="button"]'));
+              const hit = els.find(el => texts.includes((el.textContent||"").trim().toLowerCase()));
               if (hit) hit.click();
             });
-            await page.waitForTimeout(600);
+            await sleep(600);
           }
 
           async function applyCharterFilter(page){
-            // Busca el control de Charter por texto o value/id
-            const clicked = await page.evaluate(() => {
-              const byLabel = Array.from(document.querySelectorAll('label')).find(l => (l.textContent||"").trim().toLowerCase() === 'charter');
-              if (byLabel){
-                const inp = byLabel.querySelector('input');
-                if (inp) { inp.click(); return true; }
-                byLabel.click(); return true;
+            // Intenta pulsar el filtro "Charter". Si no existe, seguimos sin él.
+            await page.evaluate(() => {
+              const byLabel = Array.from(document.querySelectorAll('label'))
+                .find(l => (l.textContent||"").trim().toLowerCase() === 'charter');
+              if (byLabel) {
+                const inp = byLabel.querySelector('input'); if (inp) inp.click(); else byLabel.click();
+                return;
               }
-              const inp = document.querySelector('input[id*="charter" i], input[value*="charter" i], input[name*="charter" i]');
-              if (inp){ inp.click(); return true; }
-              // botones/links
-              const btn = Array.from(document.querySelectorAll('button,a,span')).find(n => (n.textContent||"").trim().toLowerCase()==='charter');
-              if (btn){ btn.click(); return true; }
-              return false;
+              const inp = document.querySelector('input[id*="charter" i],input[value*="charter" i],input[name*="charter" i]');
+              if (inp) inp.click();
             });
-            await page.waitForTimeout(1200);
-            return clicked;
+            await sleep(1200);
           }
 
           async function autoScroll(page, max=40, wait=1200){
             let last = 0;
             for (let i=0;i<max;i++){
               await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-              await page.waitForTimeout(wait);
-              const cnt = await page.$$eval('article.node--type-supermarket-map', els => els.length);
+              await sleep(wait);
+              const cnt = await page.$$eval('article.node--type-supermarket-map', els => els.length).catch(()=>0);
               if (cnt <= last) break;
               last = cnt;
             }
@@ -74,14 +70,14 @@ jobs:
           }
 
           (async ()=>{
-            const browser = await puppeteer.launch({ headless:"new", args:["--no-sandbox","--disable-setuid-sandbox"] });
+            const browser = await puppeteer.launch({ headless: true, args:["--no-sandbox","--disable-setuid-sandbox"] });
             const page = await browser.newPage();
             await page.setUserAgent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125 Safari/537.36");
             await page.setExtraHTTPHeaders({ "Accept-Language":"es-ES,es;q=0.9" });
 
             await page.goto(START, { waitUntil:"domcontentloaded", timeout:60000 });
             await clickCookieIfAny(page);
-            await applyCharterFilter(page).catch(()=>{});
+            await applyCharterFilter(page); // si falla, no se rompe
             const n = await autoScroll(page);
             console.error(`[SCROLL] tarjetas=${n}`);
 
@@ -89,12 +85,12 @@ jobs:
               els.map(el => {
                 const a = el.querySelector('.supermarket-label a');
                 return {
-                  html: el.innerHTML.toLowerCase(),
+                  html: (el.innerHTML||"").toLowerCase(),
                   url: a ? a.href : null,
                   name: a ? a.textContent.trim() : null
                 };
               })
-            );
+            ).catch(()=>[]);
 
             const charterCards = cards
               .filter(c => c.url && (c.html.includes('col-distancia charter') || c.html.includes('icon_map_charter')))
@@ -107,9 +103,8 @@ jobs:
             for (const s of charterCards){
               try{
                 await detail.goto(s.url, { waitUntil:"domcontentloaded", timeout:60000 });
-
                 // JSON-LD
-                const ldTexts = await detail.$$eval('script[type="application/ld+json"]', ns => ns.map(n=>n.textContent));
+                const ldTexts = await detail.$$eval('script[type="application/ld+json"]', ns => ns.map(n=>n.textContent)).catch(()=>[]);
                 let addr=null, lat=null, lon=null;
                 for (const txt of ldTexts){
                   try{
@@ -127,10 +122,10 @@ jobs:
                   if (m){ lon=+m[1]; lat=+m[2]; }
                 }
                 const nid = await detail.evaluate(() => {
-                  const l = document.querySelector('link[rel="shortlink"]');
-                  const m = l && l.href.match(/\/node\/(\d+)/);
+                  const link = document.querySelector('link[rel="shortlink"]');
+                  const m = link && link.href.match(/\/node\/(\d+)/);
                   return m ? m[1] : null;
-                });
+                }).catch(()=>null);
 
                 out.push({ id:nid, name:s.name, address:addr, lat, lon, url:s.url, ensena:"Charter", province:"barcelona" });
               }catch{}
@@ -147,7 +142,7 @@ jobs:
 
             await fs.mkdir("docs", { recursive:true });
             await fs.writeFile("docs/charter.json", JSON.stringify({
-              source:"puppeteer (filtro UI + scroll + ficha)",
+              source:"puppeteer (filtro UI opcional + scroll + ficha)",
               city:"barcelona",
               last_updated:new Date().toISOString(),
               count: items.length,
