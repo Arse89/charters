@@ -1,129 +1,197 @@
-# dentro del mismo paso "Build JSON ..."
-- name: Build JSON (con paginación)
-  env: { CITY: ${{ github.event.inputs.city }} }
-  run: |
-    node - <<'JS'
-    const fs = require("fs/promises");
-    const CITY = (process.env.CITY || "barcelona").toLowerCase();
-    const ORIGIN = "https://www.consum.es";
-    const FEED  = `${ORIGIN}/get-map-list/block_supermercados_en_${CITY}/`;
-    const H = {
-      "User-Agent":"Mozilla/5.0",
-      "Accept":"application/json, text/javascript, */*; q=0.01",
-      "Accept-Language":"es-ES,es;q=0.9",
-      "Referer": `${ORIGIN}/supermercados/${CITY}/`
-    };
+name: charter-mvp
+on:
+  workflow_dispatch:
+    inputs:
+      city:
+        description: "Provincia slug (ej.: barcelona, valencia, alicante)"
+        required: false
+        default: "barcelona"
+permissions:
+  contents: write
 
-    const isCharter = (p={})=>{
-      const icon = String(p.icon||"").toLowerCase();
-      const html = String(p.description||"").toLowerCase();
-      return icon.includes("icon_map_charter") || html.includes(" charter");
-    };
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
 
-    async function asJson(url, opt={}){
-      const r = await fetch(url, {headers:H, ...opt});
-      const t = await r.text();
-      if(!r.ok) throw new Error(`HTTP ${r.status} ${url}\n${t.slice(0,300)}`);
-      try { return JSON.parse(t); } catch { return null; }
-    }
+      - name: Build JSON + GEOJSON (paginado, multi-bloque, debug)
+        env:
+          CITY: ${{ github.event.inputs.city }}
+        run: |
+          node - <<'JS'
+          const fs = require("fs/promises");
 
-    function collect(settings){
-      const maps = settings?.geofield_google_map || {};
-      return Object.values(maps).flatMap(m => m?.data?.features ?? []);
-    }
+          const CITY   = (process.env.CITY || "barcelona").toLowerCase();
+          const ORIGIN = "https://www.consum.es";
+          const FEED   = `${ORIGIN}/get-map-list/block_supermercados_en_${CITY}/`;
+          const REFERER= `${ORIGIN}/supermercados/${CITY}/`;
 
-    (async ()=>{
-      await fs.mkdir("docs/debug", { recursive:true });
-
-      // 1) INIT
-      const init = await asJson(FEED);
-      if(!init) throw new Error("INIT no devolvió JSON");
-      const set0 = init?.[0]?.settings || {};
-      const ajaxViews = set0?.views?.ajaxViews || {};
-      const ajaxPath  = set0?.views?.ajax_path || "/views/ajax/";
-      const libs = set0?.ajaxPageState?.libraries || "";
-      const theme= set0?.ajaxPageState?.theme || "";
-      const ajaxURL = new URL(ajaxPath, ORIGIN).toString();
-
-      let featsAll = collect(set0);
-      console.error(`[INIT] blocks=${(set0.geofield_google_map && Object.keys(set0.geofield_google_map).length)||0} raw=${featsAll.length} charter=${featsAll.filter(f=>isCharter(f.properties)).length}`);
-
-      // 2) AJAX con paginación
-      for (const [domId, v] of Object.entries(ajaxViews)) {
-        let page = 0;
-        for (;; page++) {
-          const form = new URLSearchParams({
-            view_name: v.view_name || "supermarkets",
-            view_display_id: v.view_display_id || "",
-            view_args: v.view_args || "",
-            view_path: v.view_path || "",
-            view_base_path: v.view_base_path || "supermercados",
-            view_dom_id: v.view_dom_id || "",
-            pager_element: String(v.pager_element ?? 0),
-            page: String(page),                 // <-- clave
-            per_page: "50",                     // <-- si el view lo permite
-            "ajax_page_state[libraries]": libs,
-            "ajax_page_state[theme]": theme
-          });
-
-          const r = await fetch(ajaxURL, {
-            method: "POST",
-            headers: { ...H, "Content-Type":"application/x-www-form-urlencoded; charset=UTF-8", "X-Requested-With":"XMLHttpRequest" },
-            body: form.toString()
-          });
-
-          const raw = await r.text();
-          await fs.writeFile(`docs/debug/${CITY}-ajax-${domId}-p${page}.raw.txt`, raw);
-          let resp; try { resp = JSON.parse(raw); } catch { resp = null; }
-          if (!resp) { console.error(`[AJAX] ${v.view_display_id} p${page} sin JSON`); break; }
-
-          const cmd = Array.isArray(resp) ? resp.find(x=>x?.command==="settings") : null;
-          const setX = cmd?.settings;
-          if (!setX) { console.error(`[AJAX] ${v.view_display_id} p${page} sin settings`); break; }
-
-          const feats = collect(setX);
-          const n = feats.length;
-          console.error(`[AJAX] ${v.view_display_id} p${page} raw=${n} charter=${feats.filter(f=>isCharter(f.properties)).length}`);
-          if (n === 0) break;                  // fin de páginas
-
-          featsAll = featsAll.concat(feats);
-          // heurística de corte: si las siguientes páginas repiten exactamente el mismo HTML, nos salimos
-          if (page > 20) { console.error("[AJAX] corte preventivo >20 páginas"); break; }
-        }
-      }
-
-      // 3) Normaliza + filtra + dedupe
-      const items = featsAll
-        .filter(f=>isCharter(f.properties))
-        .map(f=>{
-          const p=f.properties||{}, d=p.data||{}, c=(f.geometry?.coordinates)||[null,null];
-          const href = String(p.description||"").match(/href="([^"]+)"/)?.[1] || null;
-          return {
-            id: p.entity_id ?? null,
-            name: p.tooltip ?? null,
-            address: d.field_domicilio ?? null,
-            province: CITY,
-            lat: c[1] ?? null,
-            lon: c[0] ?? null,
-            url: href ? new URL(href, ORIGIN).toString() : null,
-            ensena: "Charter"
+          const H = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125 Safari/537.36",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "es-ES,es;q=0.9",
+            "Referer": REFERER
           };
-        });
 
-      const seen = new Set();
-      const dedup = items.filter(x=>{
-        const k = x.id ? `id:${x.id}` : `na:${x.name}|${x.address}`;
-        if(seen.has(k)) return false; seen.add(k); return true;
-      });
+          async function getText(u, opt={}) {
+            const r = await fetch(u, { headers: H, ...opt });
+            const text = await r.text();
+            if (!r.ok) throw new Error(`HTTP ${r.status} ${u}\n${text.slice(0,400)}`);
+            return text;
+          }
+          async function getJSON(u, opt={}) {
+            const text = await getText(u, opt);
+            try { return { json: JSON.parse(text), raw: text }; }
+            catch { return { json: null, raw: text }; }
+          }
 
-      await fs.writeFile("docs/charter.json", JSON.stringify({
-        source: "consum.es (get-map-list + views/ajax paginado)",
-        last_updated: new Date().toISOString(),
-        count: dedup.length,
-        items: dedup
-      }, null, 2));
+          const isCharter = (p={}) => {
+            const icon = String(p.icon||"").toLowerCase();
+            const html = String(p.description||"").toLowerCase();
+            // icono específico o clase "charter" en la tarjeta HTML
+            return icon.includes("icon_map_charter") || html.includes(" charter");
+          };
 
-      console.error(`[END] totalRaw=${featsAll.length} totalCharter=${dedup.length}`);
-      console.log("OK");
-    })().catch(e=>{ console.error(e); process.exit(1); });
-    JS
+          function collectFromSettings(settings){
+            const maps = settings?.geofield_google_map || {};
+            const blocks = Object.values(maps);
+            const feats = blocks.flatMap(b => b?.data?.features ?? []);
+            return { mapBlocks: Object.keys(maps).length, feats };
+          }
+
+          (async () => {
+            await fs.mkdir("docs/debug", { recursive: true });
+
+            // 1) Carga inicial
+            const init = await getJSON(FEED);
+            await fs.writeFile(`docs/debug/${CITY}-init.raw.txt`, init.raw);
+            if (!init.json) throw new Error("El feed inicial no es JSON. Mira docs/debug/*-init.raw.txt");
+
+            const data0 = init.json;
+            await fs.writeFile(`docs/debug/${CITY}-init.json`, JSON.stringify(data0, null, 2));
+
+            const set0  = data0?.[0]?.settings || {};
+            const ajaxViews = set0?.views?.ajaxViews || {};
+            const ajaxPath  = set0?.views?.ajax_path || "/views/ajax/";
+            const libs  = set0?.ajaxPageState?.libraries || "";
+            const theme = set0?.ajaxPageState?.theme || "";
+            const ajaxURL = new URL(ajaxPath, ORIGIN).toString();
+
+            let { mapBlocks: b0, feats: f0 } = collectFromSettings(set0);
+            console.error(`[INIT] path=${ajaxPath} blocks=${b0} raw=${f0.length} charter=${f0.filter(x=>isCharter(x.properties)).length}`);
+
+            let featsAll = f0.slice();
+
+            // 2) views/ajax con paginación page=0..N
+            for (const [domId, v] of Object.entries(ajaxViews)) {
+              let page = 0;
+              for (;; page++) {
+                const form = new URLSearchParams({
+                  view_name: v.view_name || "supermarkets",
+                  view_display_id: v.view_display_id || "",
+                  view_args: v.view_args || "",
+                  view_path: v.view_path || "",
+                  view_base_path: v.view_base_path || "supermercados",
+                  view_dom_id: v.view_dom_id || "",
+                  pager_element: String(v.pager_element ?? 0),
+                  page: String(page),
+                  per_page: "50", // si la vista lo soporta, mejor
+                  "ajax_page_state[libraries]": libs,
+                  "ajax_page_state[theme]": theme
+                });
+
+                const r = await fetch(ajaxURL, {
+                  method: "POST",
+                  headers: {
+                    ...H,
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "X-Requested-With": "XMLHttpRequest"
+                  },
+                  body: form.toString()
+                });
+
+                const raw = await r.text();
+                await fs.writeFile(`docs/debug/${CITY}-ajax-${domId}-p${page}.raw.txt`, raw);
+
+                let resp;
+                try { resp = JSON.parse(raw); } catch { resp = null; }
+                if (!resp || !Array.isArray(resp)) { console.error(`[AJAX] ${v.view_display_id} p${page} sin JSON`); break; }
+
+                const cmd = resp.find(x => x?.command === "settings");
+                const setX = cmd?.settings;
+                if (!setX) { console.error(`[AJAX] ${v.view_display_id} p${page} sin settings`); break; }
+
+                const { mapBlocks, feats } = collectFromSettings(setX);
+                const n = feats.length;
+                console.error(`[AJAX] ${v.view_display_id} p${page} blocks=${mapBlocks} raw=${n} charter=${feats.filter(x=>isCharter(x.properties)).length}`);
+
+                if (n === 0) break; // fin paginación
+
+                featsAll = featsAll.concat(feats);
+                if (page > 20) { console.error("[AJAX] corte preventivo >20 páginas"); break; }
+              }
+            }
+
+            // 3) Normaliza + filtra + dedupe
+            const items = featsAll
+              .filter(f => isCharter(f.properties))
+              .map(f => {
+                const p = f.properties || {};
+                const d = p.data || {};
+                const c = (f.geometry?.coordinates) || [null, null];
+                const href = String(p.description || "").match(/href="([^"]+)"/)?.[1] || null;
+                return {
+                  id: p.entity_id ?? null,
+                  name: p.tooltip ?? null,
+                  address: d.field_domicilio ?? null,
+                  province: CITY,
+                  lat: c[1] ?? null,
+                  lon: c[0] ?? null,
+                  url: href ? new URL(href, ORIGIN).toString() : null,
+                  ensena: "Charter"
+                };
+              });
+
+            const seen = new Set();
+            const dedup = items.filter(x => {
+              const k = x.id ? `id:${x.id}` : `na:${x.name}|${x.address}`;
+              if (seen.has(k)) return false; seen.add(k); return true;
+            });
+
+            // 4) Salidas
+            await fs.writeFile("docs/charter.json", JSON.stringify({
+              source: "consum.es (get-map-list + views/ajax paginado)",
+              last_updated: new Date().toISOString(),
+              count: dedup.length,
+              items: dedup
+            }, null, 2));
+
+            await fs.writeFile("docs/charter.geojson", JSON.stringify({
+              type: "FeatureCollection",
+              features: dedup.map(s => ({
+                type: "Feature",
+                geometry: { type: "Point", coordinates: [s.lon, s.lat] },
+                properties: { id: s.id, name: s.name, address: s.address, province: s.province, url: s.url, ensena: s.ensena }
+              }))
+            }, null, 2));
+
+            console.error(`[END] totalRaw=${featsAll.length} totalCharter=${dedup.length}`);
+            console.log("OK");
+          })().catch(e => { console.error(e); process.exit(1); });
+          JS
+
+      - name: Commit if changed
+        run: |
+          if [[ -n "$(git status --porcelain docs)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add docs
+            git commit -m "mvp: ${CITY:-barcelona} Charter [skip ci]" || true
+            git push
+          else
+            echo "Sin cambios"
+          fi
